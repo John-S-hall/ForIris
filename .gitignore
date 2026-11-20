@@ -4,6 +4,8 @@ package-lock.json
 
 # Build & Wrangler outputs
 dist/
+!userscript/dist/
+!userscript/dist/*.user.js
 .wrangler/
 .dev.vars
 
