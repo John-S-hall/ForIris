@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Build & Wrangler outputs
+dist/
+.wrangler/
+.dev.vars
+
+# Temporary & media test files
+*.mp3
+*.wav
+*.log
+
+# System files
+.DS_Store
+Thumbs.db
