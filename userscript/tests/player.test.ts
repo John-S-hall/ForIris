@@ -207,4 +207,47 @@ describe('player.ts - 核心播放器与预取状态机', () => {
     expect(onChapterEndMock).toHaveBeenCalled();
     expect(player.getState()).toBe('idle');
   });
+
+  it('unlockAllAudio 同步调用解锁 audio 与 speechSynthesis', () => {
+    const player = new NovelPlayer({
+      provider: mockProvider,
+    });
+    player.unlockAllAudio();
+    expect(window.HTMLMediaElement.prototype.play).toHaveBeenCalled();
+    expect(window.speechSynthesis.speak).toHaveBeenCalled();
+  });
+
+  it('play 遭遇 NotAllowedError 时回滚为 paused 状态并弹出提示', async () => {
+    const toasts: string[] = [];
+    window.HTMLMediaElement.prototype.play = vi.fn().mockRejectedValue({
+      name: 'NotAllowedError',
+      message: 'The play method is not allowed by user gesture',
+    });
+
+    const player = new NovelPlayer({
+      provider: mockProvider,
+      events: {
+        onToast: (msg) => toasts.push(msg),
+      },
+    });
+
+    await player.playChapter(testChapter);
+
+    expect(player.getState()).toBe('paused');
+    expect(toasts.some((t) => t.includes('再点一次播放解锁声音'))).toBe(true);
+  });
+
+  it('未配置 Worker 时可主动切换至 switchToFallback 模式', () => {
+    const toasts: string[] = [];
+    const player = new NovelPlayer({
+      provider: mockProvider,
+      events: {
+        onToast: (msg) => toasts.push(msg),
+      },
+    });
+
+    player.switchToFallback('未配置 Worker，已自动使用系统语音朗读');
+    expect(player.isFallbackMode()).toBe(true);
+    expect(toasts.some((t) => t.includes('系统语音朗读'))).toBe(true);
+  });
 });

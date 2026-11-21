@@ -6,7 +6,7 @@ import { EdgeWorkerTTSProvider } from './core/tts/edgeWorker';
 import { FloatingBar } from './ui/floatingBar';
 import type { ChapterContent } from './core/tts/types';
 
-export const VERSION = '0.1.0';
+export const VERSION = '0.2.0';
 
 function initNovelTTS(): void {
   // 1. 防重复挂载：严格禁止在子 iframe 中运行
@@ -19,13 +19,14 @@ function initNovelTTS(): void {
 
   // 3. 初始化 Provider 与 辅助引擎
   const workerProvider = new EdgeWorkerTTSProvider({
-    workerUrl: config.workerUrl || 'http://localhost:8787',
+    workerUrl: config.workerUrl || '',
     token: config.token || 'dev-secret',
   });
 
   const chapterLoader = new ChapterLoader(window.location.href);
   let currentChapter: ChapterContent | null = null;
   let nextChapterUrl: string | null = null;
+  let isActionPending = false;
 
   // 4. 初始化播放器
   const player = new NovelPlayer({
@@ -43,26 +44,29 @@ function initNovelTTS(): void {
         bar.showToast(msg);
       },
       onChapterEnd: () => {
-        handleAutoNextChapter();
+        handleAutoNextChapter(false);
       },
     },
   });
 
-  // 5. 自动下一章连播逻辑
-  const handleAutoNextChapter = async () => {
+  // 5. 下一章连播逻辑 (isManual: 是否用户手动点击)
+  const handleAutoNextChapter = async (isManual = false) => {
     if (!nextChapterUrl) {
       bar.showToast('已播放至最后一章');
       return;
     }
 
+    if (isActionPending) return;
+    isActionPending = true;
+
     bar.showToast('正在加载下一章…');
+    const targetUrl = nextChapterUrl;
+
     try {
-      const targetUrl = nextChapterUrl;
       const loaded = await chapterLoader.loadChapter(targetUrl);
 
       if (!loaded || loaded.paragraphs.length === 0) {
-        bar.showToast('下一章正文提取失败或已到达全书末尾');
-        return;
+        throw new Error('下一章正文提取失败或已到达全书末尾');
       }
 
       currentChapter = loaded;
@@ -83,46 +87,71 @@ function initNovelTTS(): void {
       // 无缝续播
       await player.playChapter(loaded);
     } catch (err: any) {
-      console.error('[NovelTTS] Failed to auto advance chapter:', err);
-      bar.showToast(`下一章加载失败: ${err.message || err}`);
+      console.warn('[NovelTTS] Failed to load next chapter silently:', err);
+
+      // 手动点击「下一章」时遇到防爬限制 (如 403) 则兜底直接跳转
+      if (isManual) {
+        bar.showToast('防爬限制，正在直接跳转下一章…');
+        setTimeout(() => {
+          window.location.href = targetUrl;
+        }, 300);
+      } else {
+        bar.showToast(`下一章加载失败: ${err?.message || err}`);
+      }
+    } finally {
+      isActionPending = false;
     }
   };
 
   // 6. 初始化悬浮 UI
   const bar = new FloatingBar(config, {
     onPlayToggle: async () => {
-      const state = player.getState();
-      if (state === 'playing') {
-        player.pause();
-        return;
-      }
-      if (state === 'paused') {
-        player.resume();
-        return;
-      }
+      // 核心修复 3：第一行必须同步解锁，严禁放在 await 之后！
+      player.unlockAllAudio();
 
-      // 从 idle 状态启动播放
-      if (!currentChapter) {
-        bar.showToast('正在解析小说正文…');
-        const extracted = extractChapterContent(document, window.location.href);
+      if (isActionPending) return;
+      isActionPending = true;
 
-        if (!extracted || extracted.paragraphs.length === 0) {
-          bar.showToast('未识别到小说正文，无法播放');
+      try {
+        const state = player.getState();
+        if (state === 'playing') {
+          player.pause();
+          return;
+        }
+        if (state === 'paused') {
+          player.resume();
           return;
         }
 
-        currentChapter = extracted;
-        nextChapterUrl = extracted.nextChapterUrl;
-        chapterLoader.markVisited(window.location.href);
-        bar.updateChapter(extracted.title, extracted.nextChapterUrl);
-      }
+        // 未配置 Worker 时干净处理：直接走系统语音，无需空等网络报错
+        const currentCfg = ConfigStorage.load();
+        if (!currentCfg.workerUrl) {
+          player.switchToFallback('未配置 Worker，已自动使用系统语音朗读（可点齿轮配置）');
+        }
 
-      // 未配置 Worker 时友好提示
-      if (!config.workerUrl) {
-        bar.showToast('未配置 Worker，将自动使用系统语音试听（可点右上角齿轮配置）');
-      }
+        // 核心修复 5：若当前页面已解析过，直接重放或从当前进度启动，不重复弹“正在解析…”
+        if (!currentChapter || currentChapter.paragraphs.length === 0) {
+          bar.showToast('正在解析小说正文…');
+          const extracted = extractChapterContent(document, window.location.href);
 
-      await player.playChapter(currentChapter);
+          if (!extracted || extracted.paragraphs.length === 0) {
+            bar.showToast('未识别到小说正文，无法播放');
+            return;
+          }
+
+          currentChapter = extracted;
+          nextChapterUrl = extracted.nextChapterUrl;
+          chapterLoader.markVisited(window.location.href);
+          bar.updateChapter(extracted.title, extracted.nextChapterUrl);
+        }
+
+        await player.playChapter(currentChapter);
+      } catch (err: any) {
+        console.error('[NovelTTS] Play error:', err);
+        bar.showToast(`播放失败: ${err?.message || err}`);
+      } finally {
+        isActionPending = false;
+      }
     },
     onNextSentence: () => {
       player.nextSentence();
@@ -131,7 +160,7 @@ function initNovelTTS(): void {
       player.previousSentence();
     },
     onNextChapter: () => {
-      handleAutoNextChapter();
+      handleAutoNextChapter(true);
     },
     onRateChange: (rate) => {
       player.setRate(rate);
@@ -147,17 +176,23 @@ function initNovelTTS(): void {
       player.setProvider(workerProvider);
       bar.showToast('配置已保存并生效');
     },
+    onTestConfig: async (workerUrl, token) => {
+      return await workerProvider.testConnection(workerUrl, token);
+    },
     onJumpChapterUrl: (url) => {
       window.location.href = url;
     },
+    onBallPositionChange: (pos) => {
+      ConfigStorage.save({ ballPosition: pos });
+    },
   });
 
-  // 7. 挂载 UI 并注册油猴菜单
+  // 7. 挂载 UI（挂载至 documentElement，确保最高层级与防 body overflow）
   const mountUI = () => {
-    bar.mount(document.body);
+    bar.mount(document.documentElement || document.body);
   };
 
-  if (document.body) {
+  if (document.documentElement || document.body) {
     mountUI();
   } else {
     window.addEventListener('DOMContentLoaded', mountUI);

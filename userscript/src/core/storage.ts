@@ -1,8 +1,14 @@
+export interface BallPosition {
+  side: 'left' | 'right';
+  offsetTop: number;
+}
+
 export interface AppConfig {
   workerUrl: string;
   token: string;
   voice: string;
   rate: number;
+  ballPosition?: BallPosition;
 }
 
 export const DEFAULT_CONFIG: AppConfig = {

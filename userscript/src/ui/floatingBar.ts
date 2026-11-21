@@ -1,5 +1,6 @@
-import type { AppConfig } from '../core/storage';
+import type { AppConfig, BallPosition } from '../core/storage';
 import type { PlayerState } from '../core/tts/types';
+import type { ConnectionTestResult } from '../core/tts/edgeWorker';
 
 export interface FloatingBarEvents {
   onPlayToggle: () => void;
@@ -9,7 +10,9 @@ export interface FloatingBarEvents {
   onRateChange: (rate: number) => void;
   onVoiceChange: (voice: string) => void;
   onSaveConfig: (workerUrl: string, token: string) => void;
+  onTestConfig: (workerUrl: string, token: string) => Promise<ConnectionTestResult>;
   onJumpChapterUrl?: (url: string) => void;
+  onBallPositionChange?: (pos: BallPosition) => void;
 }
 
 export class FloatingBar {
@@ -26,6 +29,7 @@ export class FloatingBar {
   private currentChapterUrl: string | null = null;
   private currentRate = 1.2;
   private currentVoice = 'zh-CN-XiaoxiaoNeural';
+  private ballPosition: BallPosition = { side: 'right', offsetTop: 0 };
 
   // DOM 元素引用
   private ballEl!: HTMLElement;
@@ -40,6 +44,8 @@ export class FloatingBar {
   private settingsDrawer!: HTMLElement;
   private workerInput!: HTMLInputElement;
   private tokenInput!: HTMLInputElement;
+  private testBtn!: HTMLButtonElement;
+  private testResultEl!: HTMLElement;
   private jumpChapterBtn!: HTMLElement;
 
   private toastTimer: any = null;
@@ -48,18 +54,24 @@ export class FloatingBar {
     this.events = events;
     this.currentRate = config.rate;
     this.currentVoice = config.voice;
+    if (config.ballPosition) {
+      this.ballPosition = config.ballPosition;
+    }
 
     this.host = document.createElement('div');
     this.host.id = 'novel-tts-floating-root';
     this.shadow = this.host.attachShadow({ mode: 'open' });
 
     this.render(config);
+    this.applyBallPosition();
     this.bindEvents();
+    this.bindDragEvents();
   }
 
-  mount(parent: HTMLElement = document.body): void {
-    if (!parent.contains(this.host)) {
-      parent.appendChild(this.host);
+  mount(parent?: HTMLElement): void {
+    const target = parent || document.documentElement || document.body;
+    if (target && !target.contains(this.host)) {
+      target.appendChild(this.host);
     }
   }
 
@@ -125,39 +137,43 @@ export class FloatingBar {
         line-height: 1.4;
         color: #f1f5f9;
         -webkit-tap-highlight-color: transparent;
-        z-index: 2147483647;
+        z-index: 2147483647 !important;
+        position: relative;
       }
 
       /* 悬浮小球 (折叠态) */
       .ball {
         position: fixed;
-        bottom: 70px;
-        right: 18px;
+        bottom: 160px;
+        right: 12px;
         width: 46px;
         height: 46px;
         border-radius: 50%;
-        background: rgba(30, 41, 59, 0.88);
+        background: rgba(30, 41, 59, 0.92);
         backdrop-filter: blur(10px);
         -webkit-backdrop-filter: blur(10px);
-        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.15);
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.15);
         display: flex;
         align-items: center;
         justify-content: center;
-        cursor: pointer;
+        cursor: grab;
         user-select: none;
-        transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 0.2s;
-        z-index: 100;
+        touch-action: none;
+        transition: box-shadow 0.2s, background 0.2s;
+        z-index: 2147483647;
       }
       .ball:active {
-        transform: scale(0.92);
+        cursor: grabbing;
+        transform: scale(0.95);
       }
       .ball-icon {
         width: 22px;
         height: 22px;
         fill: #38bdf8;
+        pointer-events: none;
       }
       .ball.playing {
-        box-shadow: 0 0 14px rgba(56, 189, 248, 0.6), 0 0 0 1px rgba(56, 189, 248, 0.4);
+        box-shadow: 0 0 14px rgba(56, 189, 248, 0.65), 0 0 0 1px rgba(56, 189, 248, 0.5);
         animation: pulse 2.4s infinite ease-in-out;
       }
       @keyframes pulse {
@@ -171,16 +187,16 @@ export class FloatingBar {
         bottom: 0;
         left: 0;
         right: 0;
-        background: rgba(15, 23, 42, 0.94);
+        background: rgba(15, 23, 42, 0.95);
         backdrop-filter: blur(20px);
         -webkit-backdrop-filter: blur(20px);
         border-top: 1px solid rgba(255, 255, 255, 0.12);
-        box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.4);
+        box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.45);
         padding: 14px 16px env(safe-area-inset-bottom, 14px);
         box-sizing: border-box;
         transform: translateY(105%);
         transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1);
-        z-index: 101;
+        z-index: 2147483647;
       }
       .panel.open {
         transform: translateY(0);
@@ -244,12 +260,12 @@ export class FloatingBar {
         color: #94a3b8;
       }
 
-      /* 当前朗读句预览 */
+      /* 当前朗读句预览 (严格2行高度，不露第3行半截) */
       .sentence-preview {
         font-size: 13px;
-        color: #cbd5e1;
-        min-height: 36px;
-        max-height: 36px;
+        line-height: 1.5;
+        height: 39px;
+        max-height: 39px;
         margin-bottom: 12px;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -259,6 +275,7 @@ export class FloatingBar {
         background: rgba(255, 255, 255, 0.04);
         padding: 6px 10px;
         border-radius: 6px;
+        box-sizing: content-box;
       }
 
       /* 控制按钮主行 */
@@ -364,7 +381,6 @@ export class FloatingBar {
         outline: none;
       }
       .save-btn {
-        width: 100%;
         background: #0284c7;
         color: #ffffff;
         border: none;
@@ -373,10 +389,42 @@ export class FloatingBar {
         font-size: 12px;
         font-weight: 500;
         cursor: pointer;
-        margin-top: 4px;
       }
       .save-btn:active {
         background: #0369a1;
+      }
+      .test-btn {
+        background: rgba(255, 255, 255, 0.1);
+        color: #38bdf8;
+        border: 1px solid rgba(56, 189, 248, 0.3);
+        padding: 7px;
+        border-radius: 6px;
+        font-size: 12px;
+        font-weight: 500;
+        cursor: pointer;
+      }
+      .test-btn:active {
+        background: rgba(56, 189, 248, 0.2);
+      }
+      .test-result {
+        display: none;
+        margin-top: 8px;
+        padding: 6px 10px;
+        border-radius: 6px;
+        font-size: 11px;
+        line-height: 1.4;
+      }
+      .test-result.success {
+        display: block;
+        background: rgba(34, 197, 94, 0.15);
+        border: 1px solid rgba(34, 197, 94, 0.3);
+        color: #86efac;
+      }
+      .test-result.error {
+        display: block;
+        background: rgba(239, 68, 68, 0.15);
+        border: 1px solid rgba(239, 68, 68, 0.3);
+        color: #fca5a5;
       }
 
       /* 提示 Toast */
@@ -394,7 +442,7 @@ export class FloatingBar {
         opacity: 0;
         pointer-events: none;
         transition: opacity 0.25s, transform 0.25s;
-        z-index: 102;
+        z-index: 2147483647;
         max-width: 80%;
         text-align: center;
       }
@@ -476,7 +524,11 @@ export class FloatingBar {
             <label>Worker 鉴权密钥 (Token)</label>
             <input type="text" id="tts-token" placeholder="dev-secret" value="${config.token}"/>
           </div>
-          <button class="save-btn" id="tts-save-config">保存配置</button>
+          <div style="display: flex; gap: 8px; margin-top: 6px;">
+            <button class="save-btn" id="tts-save-config" style="flex: 1;">保存配置</button>
+            <button class="test-btn" id="tts-test-config" style="flex: 1;">测试连接</button>
+          </div>
+          <div class="test-result" id="tts-test-result"></div>
         </div>
       </div>
 
@@ -500,19 +552,158 @@ export class FloatingBar {
     this.settingsDrawer = this.shadow.querySelector('#tts-drawer')!;
     this.workerInput = this.shadow.querySelector('#tts-worker-url')! as HTMLInputElement;
     this.tokenInput = this.shadow.querySelector('#tts-token')! as HTMLInputElement;
+    this.testBtn = this.shadow.querySelector('#tts-test-config')! as HTMLButtonElement;
+    this.testResultEl = this.shadow.querySelector('#tts-test-result')!;
     this.jumpChapterBtn = this.shadow.querySelector('#tts-jump')!;
 
     this.voiceSelect.value = config.voice;
   }
 
+  private applyBallPosition(): void {
+    if (!this.ballPosition || !this.ballPosition.offsetTop) {
+      // 保持默认 CSS 初始位置
+      return;
+    }
+    const { side, offsetTop } = this.ballPosition;
+    this.ballEl.style.top = `${offsetTop}px`;
+    this.ballEl.style.bottom = 'auto';
+    if (side === 'left') {
+      this.ballEl.style.left = '12px';
+      this.ballEl.style.right = 'auto';
+    } else {
+      this.ballEl.style.right = '12px';
+      this.ballEl.style.left = 'auto';
+    }
+  }
+
+  // ─── 拖拽与吸附逻辑 ─────────────────────────────────────────────────────
+
+  private bindDragEvents(): void {
+    let startX = 0;
+    let startY = 0;
+    let initialLeft = 0;
+    let initialTop = 0;
+    let isDragging = false;
+    let hasMoved = false;
+
+    const onStart = (clientX: number, clientY: number) => {
+      isDragging = true;
+      hasMoved = false;
+      startX = clientX;
+      startY = clientY;
+
+      const rect = this.ballEl.getBoundingClientRect();
+      initialLeft = rect.left;
+      initialTop = rect.top;
+      this.ballEl.style.transition = 'none';
+    };
+
+    const onMove = (clientX: number, clientY: number) => {
+      if (!isDragging) return;
+      const dx = clientX - startX;
+      const dy = clientY - startY;
+
+      if (!hasMoved && Math.hypot(dx, dy) > 8) {
+        hasMoved = true;
+      }
+
+      if (hasMoved) {
+        let currentLeft = initialLeft + dx;
+        let currentTop = initialTop + dy;
+
+        // 视口边界约束
+        const maxX = window.innerWidth - 46;
+        const maxY = window.innerHeight - 46;
+        currentLeft = Math.max(0, Math.min(maxX, currentLeft));
+        currentTop = Math.max(40, Math.min(maxY - 40, currentTop));
+
+        this.ballEl.style.left = `${currentLeft}px`;
+        this.ballEl.style.top = `${currentTop}px`;
+        this.ballEl.style.right = 'auto';
+        this.ballEl.style.bottom = 'auto';
+      }
+    };
+
+    const onEnd = () => {
+      if (!isDragging) return;
+      isDragging = false;
+      this.ballEl.style.transition = 'left 0.25s cubic-bezier(0.16, 1, 0.3, 1), right 0.25s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.2s';
+
+      if (hasMoved) {
+        const rect = this.ballEl.getBoundingClientRect();
+        const screenWidth = window.innerWidth;
+        const screenHeight = window.innerHeight;
+        const ballCenterX = rect.left + rect.width / 2;
+
+        // 自动吸附到最近边缘 (左或右)
+        let side: 'left' | 'right' = 'right';
+        if (ballCenterX < screenWidth / 2) {
+          side = 'left';
+          this.ballEl.style.left = '12px';
+          this.ballEl.style.right = 'auto';
+        } else {
+          side = 'right';
+          this.ballEl.style.right = '12px';
+          this.ballEl.style.left = 'auto';
+        }
+
+        // 限制垂直高度安全区间
+        const offsetTop = Math.max(60, Math.min(screenHeight - 80, rect.top));
+        this.ballEl.style.top = `${offsetTop}px`;
+        this.ballEl.style.bottom = 'auto';
+
+        this.ballPosition = { side, offsetTop };
+        this.events.onBallPositionChange?.(this.ballPosition);
+      }
+    };
+
+    // 移动端 Touch
+    this.ballEl.addEventListener('touchstart', (e) => {
+      if (e.touches.length === 1) {
+        onStart(e.touches[0].clientX, e.touches[0].clientY);
+      }
+    }, { passive: true });
+
+    window.addEventListener('touchmove', (e) => {
+      if (isDragging && e.touches.length === 1) {
+        onMove(e.touches[0].clientX, e.touches[0].clientY);
+      }
+    }, { passive: true });
+
+    window.addEventListener('touchend', () => {
+      onEnd();
+    });
+
+    // 鼠标 Mouse
+    this.ballEl.addEventListener('mousedown', (e) => {
+      if (e.button === 0) {
+        onStart(e.clientX, e.clientY);
+      }
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (isDragging) {
+        onMove(e.clientX, e.clientY);
+      }
+    });
+
+    window.addEventListener('mouseup', () => {
+      onEnd();
+    });
+
+    // 点击小球（如果不是拖拽，则展开）
+    this.ballEl.addEventListener('click', (e) => {
+      if (hasMoved) {
+        e.stopPropagation();
+        return;
+      }
+      this.expandPanel();
+    });
+  }
+
   // ─── 事件绑定 ─────────────────────────────────────────────────────────
 
   private bindEvents(): void {
-    // 展开/收起浮层
-    this.ballEl.addEventListener('click', () => {
-      this.expandPanel();
-    });
-
     this.shadow.querySelector('#tts-close')!.addEventListener('click', () => {
       this.collapsePanel();
     });
@@ -564,7 +755,41 @@ export class FloatingBar {
       this.events.onSaveConfig(url, token);
       this.isSettingsOpen = false;
       this.settingsDrawer.classList.remove('open');
-      this.showToast('配置已保存');
+      this.showToast('配置已保存并生效');
+    });
+
+    // 测试 Worker 连接
+    this.testBtn.addEventListener('click', async () => {
+      const url = this.workerInput.value.trim();
+      const token = this.tokenInput.value.trim();
+
+      if (!url) {
+        this.showToast('请先输入 Worker 地址');
+        return;
+      }
+
+      this.testBtn.disabled = true;
+      this.testBtn.textContent = '测试中…';
+      this.testResultEl.className = 'test-result';
+      this.testResultEl.style.display = 'none';
+
+      try {
+        const res = await this.events.onTestConfig(url, token);
+        if (res.success) {
+          this.testResultEl.className = 'test-result success';
+          this.testResultEl.textContent = `✅ 连接成功 (${res.source === 'fetch' ? '原生 fetch' : 'GM_xhr'}, 耗时 ${res.duration}ms, 大小 ${res.bytes}B)`;
+        } else {
+          this.testResultEl.className = 'test-result error';
+          this.testResultEl.textContent = `❌ 连接失败: ${res.error || '未知错误'}`;
+        }
+      } catch (err: any) {
+        this.testResultEl.className = 'test-result error';
+        this.testResultEl.textContent = `❌ 测试异常: ${err?.message || err}`;
+      } finally {
+        this.testResultEl.style.display = 'block';
+        this.testBtn.disabled = false;
+        this.testBtn.textContent = '测试连接';
+      }
     });
 
     // 跳转当前章节
@@ -594,15 +819,12 @@ export class FloatingBar {
   private updatePlayButton(): void {
     const icon = this.shadow.querySelector('#tts-play-icon')!;
     if (this.playerState === 'playing') {
-      // 显示暂停图标
       icon.innerHTML = '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>';
       this.playBtn.title = '暂停';
     } else if (this.playerState === 'loading') {
-      // 保持播放图标但稍暗
       icon.innerHTML = '<path d="M8 5v14l11-7z"/>';
       this.playBtn.title = '加载中…';
     } else {
-      // 显示播放图标
       icon.innerHTML = '<path d="M8 5v14l11-7z"/>';
       this.playBtn.title = '播放';
     }

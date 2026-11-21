@@ -22,12 +22,15 @@ export class WebSpeechEngine {
 
   speak(text: string, options: TTSOptions, callbacks?: WebSpeechCallbacks): void {
     if (!this.isSupported()) {
-      callbacks?.onError?.(new Error('Web Speech Synthesis is not supported in this browser'));
+      callbacks?.onError?.(new Error('Web Speech Synthesis 在当前浏览器中不受支持'));
       return;
     }
 
     try {
-      this.cancel();
+      // iOS WebKit 修复：仅在确实有待播或正在朗读的任务时才调用 cancel()，避免吞掉当前首句
+      if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+        this.cancel();
+      }
 
       const utterance = new SpeechSynthesisUtterance(text);
       this.currentUtterance = utterance;
@@ -55,7 +58,7 @@ export class WebSpeechEngine {
         if (this.currentUtterance === utterance) {
           this.currentUtterance = null;
         }
-        callbacks?.onError?.(new Error(`SpeechSynthesis error: ${event.error}`));
+        callbacks?.onError?.(new Error(`SpeechSynthesis 朗读错误: ${event.error}`));
       };
 
       window.speechSynthesis.speak(utterance);
@@ -78,7 +81,9 @@ export class WebSpeechEngine {
 
   cancel(): void {
     if (this.isSupported()) {
-      window.speechSynthesis.cancel();
+      if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+        window.speechSynthesis.cancel();
+      }
       this.currentUtterance = null;
     }
   }
@@ -99,9 +104,6 @@ export class WebSpeechTTSProvider implements TTSProvider {
     return this.engine;
   }
 
-  /**
-   * 原生 SpeechSynthesis 并非基于音频流 Blob，直接提供朗读代理
-   */
   async synthesize(_text: string, _options: TTSOptions): Promise<string> {
     throw new Error('WebSpeechTTSProvider does not generate audio blob URLs; use direct speech mode');
   }

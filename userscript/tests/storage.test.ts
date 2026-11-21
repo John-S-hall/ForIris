@@ -46,4 +46,13 @@ describe('storage.ts - 跨站配置持久化与降级存储', () => {
     expect(loaded.voice).toBe('zh-CN-YunxiNeural');
     expect(loaded.rate).toBe(1.2);
   });
+
+  it('支持持久化悬浮球位置 (ballPosition)', () => {
+    ConfigStorage.save({
+      ballPosition: { side: 'left', offsetTop: 240 },
+    });
+
+    const loaded = ConfigStorage.load();
+    expect(loaded.ballPosition).toEqual({ side: 'left', offsetTop: 240 });
+  });
 });

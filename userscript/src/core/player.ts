@@ -100,6 +100,14 @@ export class NovelPlayer {
     this.clearPrefetchCache();
   }
 
+  switchToFallback(reason?: string): void {
+    this.isUsingFallback = true;
+    this.clearPrefetchCache();
+    if (reason) {
+      this.events.onToast?.(reason);
+    }
+  }
+
   private setState(newState: PlayerState): void {
     if (this.state === newState) return;
     this.state = newState;
@@ -107,7 +115,7 @@ export class NovelPlayer {
     this.updateMediaSessionState();
   }
 
-  // ─── 音频事件与解锁 ──────────────────────────────────────────────────
+  // ─── 音频事件与同步解锁 ──────────────────────────────────────────────────
 
   private setupAudioListeners(): void {
     if (!this.audio || typeof this.audio.addEventListener !== 'function') return;
@@ -124,26 +132,46 @@ export class NovelPlayer {
   }
 
   /**
-   * 用户手势同步调用栈内解锁单例 Audio
+   * 同步解锁函数：必须在播放手势的第一行同步调用
+   * 一次性同步解锁：1) <audio> 实例；2) window.speechSynthesis
    */
-  private unlockAudio(): void {
-    if (this.isAudioUnlocked || !this.audio || typeof this.audio.play !== 'function') return;
-    try {
-      this.audio.src = SILENT_AUDIO_WAV;
-      const playPromise = this.audio.play();
-      if (playPromise && typeof playPromise.then === 'function') {
-        playPromise
-          .then(() => {
-            this.isAudioUnlocked = true;
-          })
-          .catch(() => {
-            // 解锁失败不阻断后续流
-          });
-      } else {
-        this.isAudioUnlocked = true;
+  unlockAllAudio(): void {
+    // 1. 同步解锁单例 HTMLAudioElement
+    if (this.audio && typeof this.audio.play === 'function') {
+      try {
+        if (!this.audio.src || this.audio.src === '' || this.audio.src === SILENT_AUDIO_WAV) {
+          this.audio.src = SILENT_AUDIO_WAV;
+        }
+        const playPromise = this.audio.play();
+        if (playPromise && typeof playPromise.then === 'function') {
+          playPromise
+            .then(() => {
+              this.isAudioUnlocked = true;
+            })
+            .catch(() => {
+              // 忽略静音测试播放错误
+            });
+        } else {
+          this.isAudioUnlocked = true;
+        }
+      } catch {
+        // 忽略
       }
-    } catch {
-      // 忽略模拟器/测试环境异常
+    }
+
+    // 2. 同步解锁 window.speechSynthesis
+    if (
+      typeof window !== 'undefined' &&
+      'speechSynthesis' in window &&
+      typeof SpeechSynthesisUtterance !== 'undefined'
+    ) {
+      try {
+        const dummyUtterance = new SpeechSynthesisUtterance('');
+        dummyUtterance.volume = 0;
+        window.speechSynthesis.speak(dummyUtterance);
+      } catch {
+        // 忽略
+      }
     }
   }
 
@@ -358,7 +386,7 @@ export class NovelPlayer {
    * 载入章节并开始播放
    */
   async playChapter(chapter: ChapterContent, startIndex = 0): Promise<void> {
-    this.unlockAudio();
+    this.unlockAllAudio();
     this.stop();
 
     this.currentChapter = chapter;
@@ -408,7 +436,17 @@ export class NovelPlayer {
       this.audio.src = blobUrl;
       const playPromise = this.audio.play();
       if (playPromise && typeof playPromise.then === 'function') {
-        await playPromise;
+        try {
+          await playPromise;
+        } catch (playErr: any) {
+          // iOS Safari 自动播放拦截处理 (NotAllowedError)
+          if (playErr.name === 'NotAllowedError') {
+            this.setState('paused');
+            this.events.onToast?.('请再点一次播放解锁声音');
+            return;
+          }
+          throw playErr;
+        }
       }
 
       this.setState('playing');
@@ -524,7 +562,12 @@ export class NovelPlayer {
     } else if (this.audio && typeof this.audio.play === 'function') {
       const playPromise = this.audio.play();
       if (playPromise && typeof playPromise.then === 'function') {
-        playPromise.catch(() => {
+        playPromise.catch((err: any) => {
+          if (err.name === 'NotAllowedError') {
+            this.setState('paused');
+            this.events.onToast?.('请再点一次播放解锁声音');
+            return;
+          }
           // 若原音频恢复失败，重新载入当前句
           this.playCurrentSentence();
         });
@@ -551,7 +594,7 @@ export class NovelPlayer {
 
   nextSentence(): void {
     if (this.sentences.length === 0) return;
-    this.unlockAudio();
+    this.unlockAllAudio();
     if (this.currentIndex < this.sentences.length - 1) {
       this.revokeCacheItem(this.currentIndex);
       this.currentIndex++;
@@ -563,7 +606,7 @@ export class NovelPlayer {
 
   previousSentence(): void {
     if (this.sentences.length === 0) return;
-    this.unlockAudio();
+    this.unlockAllAudio();
     if (this.currentIndex > 0) {
       this.revokeCacheItem(this.currentIndex);
       this.currentIndex--;
@@ -575,7 +618,7 @@ export class NovelPlayer {
 
   seek(index: number): void {
     if (this.sentences.length === 0) return;
-    this.unlockAudio();
+    this.unlockAllAudio();
     const target = Math.max(0, Math.min(index, this.sentences.length - 1));
     this.clearPrefetchCache();
     this.currentIndex = target;

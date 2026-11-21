@@ -1,7 +1,8 @@
 // ==UserScript==
 // @name         NovelTTS-Userscript
 // @namespace    https://github.com/John-S-hall/ForIris
-// @version      0.1.0
+// @version      0.2.0
+// @author       John-S-hall
 // @description  移动端网页小说听书油猴脚本
 // @match        *://*/*
 // @connect      *
@@ -2043,11 +2044,13 @@
     speak(text, options, callbacks) {
       var _a, _b;
       if (!this.isSupported()) {
-        (_a = callbacks == null ? void 0 : callbacks.onError) == null ? void 0 : _a.call(callbacks, new Error("Web Speech Synthesis is not supported in this browser"));
+        (_a = callbacks == null ? void 0 : callbacks.onError) == null ? void 0 : _a.call(callbacks, new Error("Web Speech Synthesis 在当前浏览器中不受支持"));
         return;
       }
       try {
-        this.cancel();
+        if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+          this.cancel();
+        }
         const utterance = new SpeechSynthesisUtterance(text);
         this.currentUtterance = utterance;
         utterance.rate = Math.max(0.5, Math.min(2.5, options.rate || 1.2));
@@ -2071,7 +2074,7 @@
           if (this.currentUtterance === utterance) {
             this.currentUtterance = null;
           }
-          (_a2 = callbacks == null ? void 0 : callbacks.onError) == null ? void 0 : _a2.call(callbacks, new Error(`SpeechSynthesis error: ${event.error}`));
+          (_a2 = callbacks == null ? void 0 : callbacks.onError) == null ? void 0 : _a2.call(callbacks, new Error(`SpeechSynthesis 朗读错误: ${event.error}`));
         };
         window.speechSynthesis.speak(utterance);
       } catch (err) {
@@ -2090,7 +2093,9 @@
     }
     cancel() {
       if (this.isSupported()) {
-        window.speechSynthesis.cancel();
+        if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+          window.speechSynthesis.cancel();
+        }
         this.currentUtterance = null;
       }
     }
@@ -2250,6 +2255,14 @@
       this.consecutiveFailures = 0;
       this.clearPrefetchCache();
     }
+    switchToFallback(reason) {
+      var _a, _b;
+      this.isUsingFallback = true;
+      this.clearPrefetchCache();
+      if (reason) {
+        (_b = (_a = this.events).onToast) == null ? void 0 : _b.call(_a, reason);
+      }
+    }
     setState(newState) {
       var _a, _b;
       if (this.state === newState) return;
@@ -2257,7 +2270,7 @@
       (_b = (_a = this.events).onStateChange) == null ? void 0 : _b.call(_a, newState);
       this.updateMediaSessionState();
     }
-    // ─── 音频事件与解锁 ──────────────────────────────────────────────────
+    // ─── 音频事件与同步解锁 ──────────────────────────────────────────────────
     setupAudioListeners() {
       if (!this.audio || typeof this.audio.addEventListener !== "function") return;
       this.audio.addEventListener("ended", () => {
@@ -2270,22 +2283,34 @@
       });
     }
     /**
-     * 用户手势同步调用栈内解锁单例 Audio
+     * 同步解锁函数：必须在播放手势的第一行同步调用
+     * 一次性同步解锁：1) <audio> 实例；2) window.speechSynthesis
      */
-    unlockAudio() {
-      if (this.isAudioUnlocked || !this.audio || typeof this.audio.play !== "function") return;
-      try {
-        this.audio.src = SILENT_AUDIO_WAV;
-        const playPromise = this.audio.play();
-        if (playPromise && typeof playPromise.then === "function") {
-          playPromise.then(() => {
+    unlockAllAudio() {
+      if (this.audio && typeof this.audio.play === "function") {
+        try {
+          if (!this.audio.src || this.audio.src === "" || this.audio.src === SILENT_AUDIO_WAV) {
+            this.audio.src = SILENT_AUDIO_WAV;
+          }
+          const playPromise = this.audio.play();
+          if (playPromise && typeof playPromise.then === "function") {
+            playPromise.then(() => {
+              this.isAudioUnlocked = true;
+            }).catch(() => {
+            });
+          } else {
             this.isAudioUnlocked = true;
-          }).catch(() => {
-          });
-        } else {
-          this.isAudioUnlocked = true;
+          }
+        } catch {
         }
-      } catch {
+      }
+      if (typeof window !== "undefined" && "speechSynthesis" in window && typeof SpeechSynthesisUtterance !== "undefined") {
+        try {
+          const dummyUtterance = new SpeechSynthesisUtterance("");
+          dummyUtterance.volume = 0;
+          window.speechSynthesis.speak(dummyUtterance);
+        } catch {
+        }
       }
     }
     // ─── 后台保活：Media Session 与 Wake Lock ────────────────────────────
@@ -2462,7 +2487,7 @@
      */
     async playChapter(chapter, startIndex = 0) {
       var _a, _b;
-      this.unlockAudio();
+      this.unlockAllAudio();
       this.stop();
       this.currentChapter = chapter;
       this.sentences = chunkText(chapter.paragraphs);
@@ -2478,7 +2503,7 @@
      * 播放当前索引所指向的句子
      */
     async playCurrentSentence() {
-      var _a, _b;
+      var _a, _b, _c, _d;
       if (this.currentIndex >= this.sentences.length) {
         this.handleChapterEnd();
         return;
@@ -2503,7 +2528,16 @@
         this.audio.src = blobUrl;
         const playPromise = this.audio.play();
         if (playPromise && typeof playPromise.then === "function") {
-          await playPromise;
+          try {
+            await playPromise;
+          } catch (playErr) {
+            if (playErr.name === "NotAllowedError") {
+              this.setState("paused");
+              (_d = (_c = this.events).onToast) == null ? void 0 : _d.call(_c, "请再点一次播放解锁声音");
+              return;
+            }
+            throw playErr;
+          }
         }
         this.setState("playing");
         this.consecutiveFailures = 0;
@@ -2599,7 +2633,13 @@
       } else if (this.audio && typeof this.audio.play === "function") {
         const playPromise = this.audio.play();
         if (playPromise && typeof playPromise.then === "function") {
-          playPromise.catch(() => {
+          playPromise.catch((err) => {
+            var _a, _b;
+            if (err.name === "NotAllowedError") {
+              this.setState("paused");
+              (_b = (_a = this.events).onToast) == null ? void 0 : _b.call(_a, "请再点一次播放解锁声音");
+              return;
+            }
             this.playCurrentSentence();
           });
         }
@@ -2621,7 +2661,7 @@
     }
     nextSentence() {
       if (this.sentences.length === 0) return;
-      this.unlockAudio();
+      this.unlockAllAudio();
       if (this.currentIndex < this.sentences.length - 1) {
         this.revokeCacheItem(this.currentIndex);
         this.currentIndex++;
@@ -2632,7 +2672,7 @@
     }
     previousSentence() {
       if (this.sentences.length === 0) return;
-      this.unlockAudio();
+      this.unlockAllAudio();
       if (this.currentIndex > 0) {
         this.revokeCacheItem(this.currentIndex);
         this.currentIndex--;
@@ -2643,7 +2683,7 @@
     }
     seek(index) {
       if (this.sentences.length === 0) return;
-      this.unlockAudio();
+      this.unlockAllAudio();
       const target = Math.max(0, Math.min(index, this.sentences.length - 1));
       this.clearPrefetchCache();
       this.currentIndex = target;
@@ -2791,6 +2831,128 @@
       }
     }
     /**
+     * 判断目标章节是否与当前网页同源
+     */
+    isSameOrigin(targetUrl) {
+      try {
+        if (typeof window === "undefined" || !window.location) return false;
+        const target = new URL(targetUrl);
+        return target.origin === window.location.origin;
+      } catch {
+        return false;
+      }
+    }
+    /**
+     * 同源通道：通过原生 window.fetch 获取 HTML（保留 Cookie 与防爬凭证）
+     */
+    async fetchChapterViaNativeFetch(targetUrl) {
+      const res = await window.fetch(targetUrl, {
+        method: "GET",
+        credentials: "include",
+        headers: {
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }
+      });
+      if (!res.ok) {
+        throw new Error(`同源 fetch 失败, HTTP ${res.status}`);
+      }
+      const buffer = await res.arrayBuffer();
+      if (!buffer || buffer.byteLength === 0) {
+        throw new Error("同源 fetch 返回空响应");
+      }
+      const contentType = res.headers.get("content-type") || "";
+      const charset = detectCharset(contentType, buffer);
+      try {
+        const decoder = new TextDecoder(charset);
+        return decoder.decode(buffer);
+      } catch {
+        const fallbackDecoder = new TextDecoder("utf-8");
+        return fallbackDecoder.decode(buffer);
+      }
+    }
+    /**
+     * 兜底通道：通过 GM_xmlhttpRequest 获取 HTML（带 10000ms JS 超时保险丝）
+     */
+    async fetchChapterViaGM(targetUrl) {
+      const gmRequest = typeof GM_xmlhttpRequest === "function" ? GM_xmlhttpRequest : null;
+      if (!gmRequest) {
+        throw new Error("GM_xmlhttpRequest 在当前环境中不可用");
+      }
+      return new Promise((resolve, reject) => {
+        var _a;
+        let settled = false;
+        let requestHandle = null;
+        let timer = null;
+        const cleanup = () => {
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
+          }
+        };
+        const finishError = (err) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(err);
+        };
+        const finishSuccess = (html) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve(html);
+        };
+        timer = setTimeout(() => {
+          try {
+            if (requestHandle && typeof requestHandle.abort === "function") {
+              requestHandle.abort();
+            }
+          } catch {
+          }
+          finishError(new Error("请求超时 (10000ms JS 保险丝触发)"));
+        }, 1e4);
+        try {
+          const headers = {
+            Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+          };
+          if (typeof window !== "undefined" && ((_a = window.location) == null ? void 0 : _a.href)) {
+            headers["Referer"] = window.location.href;
+          }
+          requestHandle = gmRequest({
+            method: "GET",
+            url: targetUrl,
+            responseType: "arraybuffer",
+            anonymous: false,
+            // 附带 Cookie
+            headers,
+            timeout: 1e4,
+            onload: (resp) => {
+              if (resp.status < 200 || resp.status >= 300) {
+                finishError(new Error(`抓取下一章失败, HTTP ${resp.status}`));
+                return;
+              }
+              const buffer = resp.response;
+              if (!buffer || buffer.byteLength === 0) {
+                finishError(new Error("抓取下一章返回空内容"));
+                return;
+              }
+              const charset = detectCharset(resp.responseHeaders || "", buffer);
+              try {
+                const decoder = new TextDecoder(charset);
+                finishSuccess(decoder.decode(buffer));
+              } catch {
+                const fallbackDecoder = new TextDecoder("utf-8");
+                finishSuccess(fallbackDecoder.decode(buffer));
+              }
+            },
+            onerror: (err) => finishError(new Error(`网络错误 (GM_xhr): ${JSON.stringify(err)}`)),
+            ontimeout: () => finishError(new Error("抓取下一章网络超时 (10000ms)"))
+          });
+        } catch (invokeErr) {
+          finishError(new Error(`GM_xmlhttpRequest 触发失败: ${(invokeErr == null ? void 0 : invokeErr.message) || invokeErr}`));
+        }
+      });
+    }
+    /**
      * 静默拉取指定章节的 HTML 并解析正文
      * @param targetUrl 下一章完整 URL
      */
@@ -2804,40 +2966,17 @@
         console.warn("[NovelTTS] Prevented loop: already visited URL:", normalized);
         return null;
       }
-      const gmRequest = typeof GM_xmlhttpRequest === "function" ? GM_xmlhttpRequest : null;
-      if (!gmRequest) {
-        throw new Error("GM_xmlhttpRequest is not available for chapter loading");
+      let html = null;
+      if (this.isSameOrigin(targetUrl) && typeof window.fetch === "function") {
+        try {
+          html = await this.fetchChapterViaNativeFetch(targetUrl);
+        } catch (fetchErr) {
+          console.warn("[NovelTTS] 同源 fetch 失败，回退至 GM_xmlhttpRequest:", fetchErr);
+        }
       }
-      const html = await new Promise((resolve, reject) => {
-        gmRequest({
-          method: "GET",
-          url: targetUrl,
-          responseType: "arraybuffer",
-          timeout: 1e4,
-          onload: (resp) => {
-            if (resp.status < 200 || resp.status >= 300) {
-              reject(new Error(`Failed to fetch chapter, HTTP ${resp.status}`));
-              return;
-            }
-            const buffer = resp.response;
-            if (!buffer || buffer.byteLength === 0) {
-              reject(new Error("Received empty response for chapter"));
-              return;
-            }
-            const charset = detectCharset(resp.responseHeaders || "", buffer);
-            try {
-              const decoder = new TextDecoder(charset);
-              const decoded = decoder.decode(buffer);
-              resolve(decoded);
-            } catch (decodeErr) {
-              const fallbackDecoder = new TextDecoder("utf-8");
-              resolve(fallbackDecoder.decode(buffer));
-            }
-          },
-          onerror: (err) => reject(new Error(`Network error loading chapter: ${JSON.stringify(err)}`)),
-          ontimeout: () => reject(new Error("Timed out loading next chapter"))
-        });
-      });
+      if (!html) {
+        html = await this.fetchChapterViaGM(targetUrl);
+      }
       const parser = new DOMParser();
       const doc = parser.parseFromString(html, "text/html");
       const content = extractChapterContent(doc, targetUrl);
@@ -2851,6 +2990,7 @@
       __publicField(this, "workerUrl");
       __publicField(this, "token");
       __publicField(this, "timeoutMs");
+      __publicField(this, "lastUsedSource", null);
       this.workerUrl = this.sanitizeUrl(options.workerUrl);
       this.token = options.token;
       this.timeoutMs = options.timeoutMs ?? 8e3;
@@ -2866,45 +3006,99 @@
         this.token = token;
       }
     }
-    async synthesize(text, options) {
-      var _a;
-      if (!text || !text.trim()) {
-        throw new Error("TTS synthesis failed: text cannot be empty");
-      }
-      if ((_a = options.signal) == null ? void 0 : _a.aborted) {
-        throw new DOMException("The synthesis request was aborted", "AbortError");
-      }
+    getLastUsedSource() {
+      return this.lastUsedSource;
+    }
+    buildUrl(text, options, customUrl, customToken) {
+      const baseUrl = customUrl ? this.sanitizeUrl(customUrl) : this.workerUrl;
+      const token = customToken !== void 0 ? customToken : this.token;
       const queryParams = new URLSearchParams({
         text: text.trim(),
         voice: options.voice || "zh-CN-XiaoxiaoNeural",
         rate: String(options.rate || 1.2),
-        token: this.token
+        token
       });
-      const targetUrl = `${this.workerUrl}/tts?${queryParams.toString()}`;
+      return `${baseUrl}/tts?${queryParams.toString()}`;
+    }
+    /**
+     * 将各种格式的响应转换为合法有效的 ArrayBuffer（校验 > 256 字节）
+     */
+    async normalizeAudioBuffer(rawResponse) {
+      let buffer = null;
+      if (rawResponse instanceof ArrayBuffer) {
+        buffer = rawResponse;
+      } else if (ArrayBuffer.isView(rawResponse)) {
+        const copy = new Uint8Array(rawResponse.byteLength);
+        copy.set(
+          new Uint8Array(
+            rawResponse.buffer,
+            rawResponse.byteOffset,
+            rawResponse.byteLength
+          )
+        );
+        buffer = copy.buffer;
+      } else if (typeof Blob !== "undefined" && rawResponse instanceof Blob) {
+        buffer = await rawResponse.arrayBuffer();
+      }
+      if (!buffer || buffer.byteLength <= 256) {
+        throw new Error(`音频数据无效或为空 (${buffer ? buffer.byteLength : 0} 字节)`);
+      }
+      return buffer;
+    }
+    /**
+     * 主通道：通过 window.fetch 获取音频
+     */
+    async synthesizeViaFetch(targetUrl, signal) {
+      const res = await window.fetch(targetUrl, {
+        method: "GET",
+        mode: "cors",
+        signal
+      });
+      if (!res.ok) {
+        if (res.status === 401) {
+          throw new Error("HTTP 401 密钥错误: 请检查 Worker Token 配置");
+        }
+        if (res.status === 502) {
+          throw new Error("HTTP 502 上游异常: Edge TTS 微软服务端合成失败");
+        }
+        throw new Error(`Edge Worker HTTP ${res.status}: ${res.statusText || "请求失败"}`);
+      }
+      const buf = await res.arrayBuffer();
+      return this.normalizeAudioBuffer(buf);
+    }
+    /**
+     * 兜底通道：通过 GM_xmlhttpRequest 获取音频（带 8500ms JS 超时保险丝）
+     */
+    async synthesizeViaGM(targetUrl, signal) {
       const gmRequest = typeof GM_xmlhttpRequest === "function" ? GM_xmlhttpRequest : null;
       if (!gmRequest) {
-        throw new Error("GM_xmlhttpRequest is not available in the current environment");
+        throw new Error("GM_xmlhttpRequest 在当前环境中不可用");
       }
       return new Promise((resolve, reject) => {
         let settled = false;
-        const cleanupSignal = () => {
-          if (options.signal) {
-            options.signal.removeEventListener("abort", onAbort);
-          }
-        };
         const finishError = (err) => {
           if (settled) return;
           settled = true;
-          cleanupSignal();
+          cleanup();
           reject(err);
         };
-        const finishSuccess = (blobUrl) => {
+        const finishSuccess = (buf) => {
           if (settled) return;
           settled = true;
-          cleanupSignal();
-          resolve(blobUrl);
+          cleanup();
+          resolve(buf);
         };
         let requestHandle = null;
+        let hardTimeoutTimer = null;
+        const cleanup = () => {
+          if (hardTimeoutTimer) {
+            clearTimeout(hardTimeoutTimer);
+            hardTimeoutTimer = null;
+          }
+          if (signal) {
+            signal.removeEventListener("abort", onAbort);
+          }
+        };
         const onAbort = () => {
           try {
             if (requestHandle && typeof requestHandle.abort === "function") {
@@ -2914,47 +3108,140 @@
           }
           finishError(new DOMException("The synthesis request was aborted", "AbortError"));
         };
-        if (options.signal) {
-          options.signal.addEventListener("abort", onAbort);
+        if (signal) {
+          signal.addEventListener("abort", onAbort);
         }
+        hardTimeoutTimer = setTimeout(() => {
+          try {
+            if (requestHandle && typeof requestHandle.abort === "function") {
+              requestHandle.abort();
+            }
+          } catch {
+          }
+          finishError(new Error("请求超时 (8500ms JS 保险丝触发)"));
+        }, 8500);
         try {
           requestHandle = gmRequest({
             method: "GET",
             url: targetUrl,
-            responseType: "blob",
+            responseType: "arraybuffer",
+            // 强制 arraybuffer，禁止 blob
             timeout: this.timeoutMs,
-            onload: (response) => {
+            onload: async (response) => {
               if (response.status < 200 || response.status >= 300) {
+                if (response.status === 401) {
+                  finishError(new Error("HTTP 401 密钥错误: 请检查 Worker Token 配置"));
+                  return;
+                }
+                if (response.status === 502) {
+                  finishError(new Error("HTTP 502 上游异常: Edge TTS 微软服务端合成失败"));
+                  return;
+                }
                 finishError(
                   new Error(
-                    `Edge Worker HTTP ${response.status}: ${response.statusText || "Request failed"}`
+                    `Edge Worker HTTP ${response.status}: ${response.statusText || "请求失败"}`
                   )
                 );
                 return;
               }
-              const blob = response.response;
-              if (!blob || blob.size === 0) {
-                finishError(new Error("Edge Worker returned an empty audio response"));
-                return;
-              }
               try {
-                const blobUrl = URL.createObjectURL(blob);
-                finishSuccess(blobUrl);
-              } catch (createErr) {
-                finishError(new Error(`Failed to create Object URL: ${createErr}`));
+                const buffer = await this.normalizeAudioBuffer(response.response);
+                finishSuccess(buffer);
+              } catch (err) {
+                finishError(err instanceof Error ? err : new Error(String(err)));
               }
             },
             onerror: (err) => {
-              finishError(new Error(`Network error requesting Edge Worker: ${JSON.stringify(err)}`));
+              finishError(new Error(`网络错误 (GM_xhr): ${JSON.stringify(err)}`));
             },
             ontimeout: () => {
-              finishError(new Error(`Edge Worker request timed out after ${this.timeoutMs}ms`));
+              finishError(new Error(`Edge Worker 请求超时 (${this.timeoutMs}ms)`));
             }
           });
         } catch (invokeErr) {
-          finishError(new Error(`Failed to invoke GM_xmlhttpRequest: ${invokeErr}`));
+          finishError(new Error(`GM_xmlhttpRequest 调用失败: ${(invokeErr == null ? void 0 : invokeErr.message) || invokeErr}`));
         }
       });
+    }
+    async synthesize(text, options) {
+      var _a;
+      if (!text || !text.trim()) {
+        throw new Error("TTS 合成失败: 文本不能为空");
+      }
+      if ((_a = options.signal) == null ? void 0 : _a.aborted) {
+        throw new DOMException("The synthesis request was aborted", "AbortError");
+      }
+      const targetUrl = this.buildUrl(text, options);
+      let audioBuffer = null;
+      let sourceUsed = "fetch";
+      try {
+        audioBuffer = await this.synthesizeViaFetch(targetUrl, options.signal);
+        sourceUsed = "fetch";
+      } catch (fetchErr) {
+        if (fetchErr.name === "AbortError") {
+          throw fetchErr;
+        }
+        if (fetchErr.message && fetchErr.message.startsWith("HTTP ")) {
+          throw fetchErr;
+        }
+        if (typeof GM_xmlhttpRequest === "function") {
+          try {
+            audioBuffer = await this.synthesizeViaGM(targetUrl, options.signal);
+            sourceUsed = "GM_xhr";
+          } catch (gmErr) {
+            throw new Error(`双通道请求均失败 (fetch: ${fetchErr.message}; GM: ${gmErr.message})`);
+          }
+        } else {
+          throw fetchErr;
+        }
+      }
+      this.lastUsedSource = sourceUsed;
+      const blob = new Blob([audioBuffer], { type: "audio/mpeg" });
+      return URL.createObjectURL(blob);
+    }
+    /**
+     * 供 UI 设置抽屉使用的「测试连接」诊断方法
+     */
+    async testConnection(customUrl, customToken) {
+      const startTime = Date.now();
+      const testText = "测试";
+      const testOptions = {
+        voice: "zh-CN-XiaoxiaoNeural",
+        rate: 1
+      };
+      const targetUrl = this.buildUrl(testText, testOptions, customUrl, customToken);
+      try {
+        let buffer;
+        let source = "fetch";
+        try {
+          buffer = await this.synthesizeViaFetch(targetUrl);
+          source = "fetch";
+        } catch (fetchErr) {
+          if (fetchErr.message && fetchErr.message.startsWith("HTTP ")) {
+            throw fetchErr;
+          }
+          if (typeof GM_xmlhttpRequest === "function") {
+            buffer = await this.synthesizeViaGM(targetUrl);
+            source = "GM_xhr";
+          } else {
+            throw fetchErr;
+          }
+        }
+        const duration = Date.now() - startTime;
+        return {
+          success: true,
+          source,
+          duration,
+          bytes: buffer.byteLength
+        };
+      } catch (err) {
+        const duration = Date.now() - startTime;
+        return {
+          success: false,
+          duration,
+          error: (err == null ? void 0 : err.message) || String(err)
+        };
+      }
     }
   }
   class FloatingBar {
@@ -2971,6 +3258,7 @@
       __publicField(this, "currentChapterUrl", null);
       __publicField(this, "currentRate", 1.2);
       __publicField(this, "currentVoice", "zh-CN-XiaoxiaoNeural");
+      __publicField(this, "ballPosition", { side: "right", offsetTop: 0 });
       // DOM 元素引用
       __publicField(this, "ballEl");
       __publicField(this, "panelEl");
@@ -2984,20 +3272,28 @@
       __publicField(this, "settingsDrawer");
       __publicField(this, "workerInput");
       __publicField(this, "tokenInput");
+      __publicField(this, "testBtn");
+      __publicField(this, "testResultEl");
       __publicField(this, "jumpChapterBtn");
       __publicField(this, "toastTimer", null);
       this.events = events;
       this.currentRate = config.rate;
       this.currentVoice = config.voice;
+      if (config.ballPosition) {
+        this.ballPosition = config.ballPosition;
+      }
       this.host = document.createElement("div");
       this.host.id = "novel-tts-floating-root";
       this.shadow = this.host.attachShadow({ mode: "open" });
       this.render(config);
+      this.applyBallPosition();
       this.bindEvents();
+      this.bindDragEvents();
     }
-    mount(parent = document.body) {
-      if (!parent.contains(this.host)) {
-        parent.appendChild(this.host);
+    mount(parent) {
+      const target = parent || document.documentElement || document.body;
+      if (target && !target.contains(this.host)) {
+        target.appendChild(this.host);
       }
     }
     unmount() {
@@ -3054,39 +3350,43 @@
         line-height: 1.4;
         color: #f1f5f9;
         -webkit-tap-highlight-color: transparent;
-        z-index: 2147483647;
+        z-index: 2147483647 !important;
+        position: relative;
       }
 
       /* 悬浮小球 (折叠态) */
       .ball {
         position: fixed;
-        bottom: 70px;
-        right: 18px;
+        bottom: 160px;
+        right: 12px;
         width: 46px;
         height: 46px;
         border-radius: 50%;
-        background: rgba(30, 41, 59, 0.88);
+        background: rgba(30, 41, 59, 0.92);
         backdrop-filter: blur(10px);
         -webkit-backdrop-filter: blur(10px);
-        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255, 255, 255, 0.15);
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.15);
         display: flex;
         align-items: center;
         justify-content: center;
-        cursor: pointer;
+        cursor: grab;
         user-select: none;
-        transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 0.2s;
-        z-index: 100;
+        touch-action: none;
+        transition: box-shadow 0.2s, background 0.2s;
+        z-index: 2147483647;
       }
       .ball:active {
-        transform: scale(0.92);
+        cursor: grabbing;
+        transform: scale(0.95);
       }
       .ball-icon {
         width: 22px;
         height: 22px;
         fill: #38bdf8;
+        pointer-events: none;
       }
       .ball.playing {
-        box-shadow: 0 0 14px rgba(56, 189, 248, 0.6), 0 0 0 1px rgba(56, 189, 248, 0.4);
+        box-shadow: 0 0 14px rgba(56, 189, 248, 0.65), 0 0 0 1px rgba(56, 189, 248, 0.5);
         animation: pulse 2.4s infinite ease-in-out;
       }
       @keyframes pulse {
@@ -3100,16 +3400,16 @@
         bottom: 0;
         left: 0;
         right: 0;
-        background: rgba(15, 23, 42, 0.94);
+        background: rgba(15, 23, 42, 0.95);
         backdrop-filter: blur(20px);
         -webkit-backdrop-filter: blur(20px);
         border-top: 1px solid rgba(255, 255, 255, 0.12);
-        box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.4);
+        box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.45);
         padding: 14px 16px env(safe-area-inset-bottom, 14px);
         box-sizing: border-box;
         transform: translateY(105%);
         transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1);
-        z-index: 101;
+        z-index: 2147483647;
       }
       .panel.open {
         transform: translateY(0);
@@ -3173,12 +3473,12 @@
         color: #94a3b8;
       }
 
-      /* 当前朗读句预览 */
+      /* 当前朗读句预览 (严格2行高度，不露第3行半截) */
       .sentence-preview {
         font-size: 13px;
-        color: #cbd5e1;
-        min-height: 36px;
-        max-height: 36px;
+        line-height: 1.5;
+        height: 39px;
+        max-height: 39px;
         margin-bottom: 12px;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -3188,6 +3488,7 @@
         background: rgba(255, 255, 255, 0.04);
         padding: 6px 10px;
         border-radius: 6px;
+        box-sizing: content-box;
       }
 
       /* 控制按钮主行 */
@@ -3293,7 +3594,6 @@
         outline: none;
       }
       .save-btn {
-        width: 100%;
         background: #0284c7;
         color: #ffffff;
         border: none;
@@ -3302,10 +3602,42 @@
         font-size: 12px;
         font-weight: 500;
         cursor: pointer;
-        margin-top: 4px;
       }
       .save-btn:active {
         background: #0369a1;
+      }
+      .test-btn {
+        background: rgba(255, 255, 255, 0.1);
+        color: #38bdf8;
+        border: 1px solid rgba(56, 189, 248, 0.3);
+        padding: 7px;
+        border-radius: 6px;
+        font-size: 12px;
+        font-weight: 500;
+        cursor: pointer;
+      }
+      .test-btn:active {
+        background: rgba(56, 189, 248, 0.2);
+      }
+      .test-result {
+        display: none;
+        margin-top: 8px;
+        padding: 6px 10px;
+        border-radius: 6px;
+        font-size: 11px;
+        line-height: 1.4;
+      }
+      .test-result.success {
+        display: block;
+        background: rgba(34, 197, 94, 0.15);
+        border: 1px solid rgba(34, 197, 94, 0.3);
+        color: #86efac;
+      }
+      .test-result.error {
+        display: block;
+        background: rgba(239, 68, 68, 0.15);
+        border: 1px solid rgba(239, 68, 68, 0.3);
+        color: #fca5a5;
       }
 
       /* 提示 Toast */
@@ -3323,7 +3655,7 @@
         opacity: 0;
         pointer-events: none;
         transition: opacity 0.25s, transform 0.25s;
-        z-index: 102;
+        z-index: 2147483647;
         max-width: 80%;
         text-align: center;
       }
@@ -3404,7 +3736,11 @@
             <label>Worker 鉴权密钥 (Token)</label>
             <input type="text" id="tts-token" placeholder="dev-secret" value="${config.token}"/>
           </div>
-          <button class="save-btn" id="tts-save-config">保存配置</button>
+          <div style="display: flex; gap: 8px; margin-top: 6px;">
+            <button class="save-btn" id="tts-save-config" style="flex: 1;">保存配置</button>
+            <button class="test-btn" id="tts-test-config" style="flex: 1;">测试连接</button>
+          </div>
+          <div class="test-result" id="tts-test-result"></div>
         </div>
       </div>
 
@@ -3425,14 +3761,127 @@
       this.settingsDrawer = this.shadow.querySelector("#tts-drawer");
       this.workerInput = this.shadow.querySelector("#tts-worker-url");
       this.tokenInput = this.shadow.querySelector("#tts-token");
+      this.testBtn = this.shadow.querySelector("#tts-test-config");
+      this.testResultEl = this.shadow.querySelector("#tts-test-result");
       this.jumpChapterBtn = this.shadow.querySelector("#tts-jump");
       this.voiceSelect.value = config.voice;
     }
-    // ─── 事件绑定 ─────────────────────────────────────────────────────────
-    bindEvents() {
-      this.ballEl.addEventListener("click", () => {
+    applyBallPosition() {
+      if (!this.ballPosition || !this.ballPosition.offsetTop) {
+        return;
+      }
+      const { side, offsetTop } = this.ballPosition;
+      this.ballEl.style.top = `${offsetTop}px`;
+      this.ballEl.style.bottom = "auto";
+      if (side === "left") {
+        this.ballEl.style.left = "12px";
+        this.ballEl.style.right = "auto";
+      } else {
+        this.ballEl.style.right = "12px";
+        this.ballEl.style.left = "auto";
+      }
+    }
+    // ─── 拖拽与吸附逻辑 ─────────────────────────────────────────────────────
+    bindDragEvents() {
+      let startX = 0;
+      let startY = 0;
+      let initialLeft = 0;
+      let initialTop = 0;
+      let isDragging = false;
+      let hasMoved = false;
+      const onStart = (clientX, clientY) => {
+        isDragging = true;
+        hasMoved = false;
+        startX = clientX;
+        startY = clientY;
+        const rect = this.ballEl.getBoundingClientRect();
+        initialLeft = rect.left;
+        initialTop = rect.top;
+        this.ballEl.style.transition = "none";
+      };
+      const onMove = (clientX, clientY) => {
+        if (!isDragging) return;
+        const dx = clientX - startX;
+        const dy = clientY - startY;
+        if (!hasMoved && Math.hypot(dx, dy) > 8) {
+          hasMoved = true;
+        }
+        if (hasMoved) {
+          let currentLeft = initialLeft + dx;
+          let currentTop = initialTop + dy;
+          const maxX = window.innerWidth - 46;
+          const maxY = window.innerHeight - 46;
+          currentLeft = Math.max(0, Math.min(maxX, currentLeft));
+          currentTop = Math.max(40, Math.min(maxY - 40, currentTop));
+          this.ballEl.style.left = `${currentLeft}px`;
+          this.ballEl.style.top = `${currentTop}px`;
+          this.ballEl.style.right = "auto";
+          this.ballEl.style.bottom = "auto";
+        }
+      };
+      const onEnd = () => {
+        var _a, _b;
+        if (!isDragging) return;
+        isDragging = false;
+        this.ballEl.style.transition = "left 0.25s cubic-bezier(0.16, 1, 0.3, 1), right 0.25s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.2s";
+        if (hasMoved) {
+          const rect = this.ballEl.getBoundingClientRect();
+          const screenWidth = window.innerWidth;
+          const screenHeight = window.innerHeight;
+          const ballCenterX = rect.left + rect.width / 2;
+          let side = "right";
+          if (ballCenterX < screenWidth / 2) {
+            side = "left";
+            this.ballEl.style.left = "12px";
+            this.ballEl.style.right = "auto";
+          } else {
+            side = "right";
+            this.ballEl.style.right = "12px";
+            this.ballEl.style.left = "auto";
+          }
+          const offsetTop = Math.max(60, Math.min(screenHeight - 80, rect.top));
+          this.ballEl.style.top = `${offsetTop}px`;
+          this.ballEl.style.bottom = "auto";
+          this.ballPosition = { side, offsetTop };
+          (_b = (_a = this.events).onBallPositionChange) == null ? void 0 : _b.call(_a, this.ballPosition);
+        }
+      };
+      this.ballEl.addEventListener("touchstart", (e) => {
+        if (e.touches.length === 1) {
+          onStart(e.touches[0].clientX, e.touches[0].clientY);
+        }
+      }, { passive: true });
+      window.addEventListener("touchmove", (e) => {
+        if (isDragging && e.touches.length === 1) {
+          onMove(e.touches[0].clientX, e.touches[0].clientY);
+        }
+      }, { passive: true });
+      window.addEventListener("touchend", () => {
+        onEnd();
+      });
+      this.ballEl.addEventListener("mousedown", (e) => {
+        if (e.button === 0) {
+          onStart(e.clientX, e.clientY);
+        }
+      });
+      window.addEventListener("mousemove", (e) => {
+        if (isDragging) {
+          onMove(e.clientX, e.clientY);
+        }
+      });
+      window.addEventListener("mouseup", () => {
+        onEnd();
+      });
+      this.ballEl.addEventListener("click", (e) => {
+        if (hasMoved) {
+          e.stopPropagation();
+          return;
+        }
         this.expandPanel();
       });
+    }
+    // ─── 事件绑定 ─────────────────────────────────────────────────────────
+    bindEvents() {
       this.shadow.querySelector("#tts-close").addEventListener("click", () => {
         this.collapsePanel();
       });
@@ -3472,7 +3921,36 @@
         this.events.onSaveConfig(url, token);
         this.isSettingsOpen = false;
         this.settingsDrawer.classList.remove("open");
-        this.showToast("配置已保存");
+        this.showToast("配置已保存并生效");
+      });
+      this.testBtn.addEventListener("click", async () => {
+        const url = this.workerInput.value.trim();
+        const token = this.tokenInput.value.trim();
+        if (!url) {
+          this.showToast("请先输入 Worker 地址");
+          return;
+        }
+        this.testBtn.disabled = true;
+        this.testBtn.textContent = "测试中…";
+        this.testResultEl.className = "test-result";
+        this.testResultEl.style.display = "none";
+        try {
+          const res = await this.events.onTestConfig(url, token);
+          if (res.success) {
+            this.testResultEl.className = "test-result success";
+            this.testResultEl.textContent = `✅ 连接成功 (${res.source === "fetch" ? "原生 fetch" : "GM_xhr"}, 耗时 ${res.duration}ms, 大小 ${res.bytes}B)`;
+          } else {
+            this.testResultEl.className = "test-result error";
+            this.testResultEl.textContent = `❌ 连接失败: ${res.error || "未知错误"}`;
+          }
+        } catch (err) {
+          this.testResultEl.className = "test-result error";
+          this.testResultEl.textContent = `❌ 测试异常: ${(err == null ? void 0 : err.message) || err}`;
+        } finally {
+          this.testResultEl.style.display = "block";
+          this.testBtn.disabled = false;
+          this.testBtn.textContent = "测试连接";
+        }
       });
       this.jumpChapterBtn.addEventListener("click", () => {
         if (this.currentChapterUrl) {
@@ -3521,12 +3999,13 @@
     }
     const config = ConfigStorage.load();
     const workerProvider = new EdgeWorkerTTSProvider({
-      workerUrl: config.workerUrl || "http://localhost:8787",
+      workerUrl: config.workerUrl || "",
       token: config.token || "dev-secret"
     });
     const chapterLoader = new ChapterLoader(window.location.href);
     let currentChapter = null;
     let nextChapterUrl = null;
+    let isActionPending = false;
     const player = new NovelPlayer({
       provider: workerProvider,
       voice: config.voice,
@@ -3542,22 +4021,23 @@
           bar.showToast(msg);
         },
         onChapterEnd: () => {
-          handleAutoNextChapter();
+          handleAutoNextChapter(false);
         }
       }
     });
-    const handleAutoNextChapter = async () => {
+    const handleAutoNextChapter = async (isManual = false) => {
       if (!nextChapterUrl) {
         bar.showToast("已播放至最后一章");
         return;
       }
+      if (isActionPending) return;
+      isActionPending = true;
       bar.showToast("正在加载下一章…");
+      const targetUrl = nextChapterUrl;
       try {
-        const targetUrl = nextChapterUrl;
         const loaded = await chapterLoader.loadChapter(targetUrl);
         if (!loaded || loaded.paragraphs.length === 0) {
-          bar.showToast("下一章正文提取失败或已到达全书末尾");
-          return;
+          throw new Error("下一章正文提取失败或已到达全书末尾");
         }
         currentChapter = loaded;
         nextChapterUrl = loaded.nextChapterUrl;
@@ -3570,37 +4050,57 @@
         }
         await player.playChapter(loaded);
       } catch (err) {
-        console.error("[NovelTTS] Failed to auto advance chapter:", err);
-        bar.showToast(`下一章加载失败: ${err.message || err}`);
+        console.warn("[NovelTTS] Failed to load next chapter silently:", err);
+        if (isManual) {
+          bar.showToast("防爬限制，正在直接跳转下一章…");
+          setTimeout(() => {
+            window.location.href = targetUrl;
+          }, 300);
+        } else {
+          bar.showToast(`下一章加载失败: ${(err == null ? void 0 : err.message) || err}`);
+        }
+      } finally {
+        isActionPending = false;
       }
     };
     const bar = new FloatingBar(config, {
       onPlayToggle: async () => {
-        const state = player.getState();
-        if (state === "playing") {
-          player.pause();
-          return;
-        }
-        if (state === "paused") {
-          player.resume();
-          return;
-        }
-        if (!currentChapter) {
-          bar.showToast("正在解析小说正文…");
-          const extracted = extractChapterContent(document, window.location.href);
-          if (!extracted || extracted.paragraphs.length === 0) {
-            bar.showToast("未识别到小说正文，无法播放");
+        player.unlockAllAudio();
+        if (isActionPending) return;
+        isActionPending = true;
+        try {
+          const state = player.getState();
+          if (state === "playing") {
+            player.pause();
             return;
           }
-          currentChapter = extracted;
-          nextChapterUrl = extracted.nextChapterUrl;
-          chapterLoader.markVisited(window.location.href);
-          bar.updateChapter(extracted.title, extracted.nextChapterUrl);
+          if (state === "paused") {
+            player.resume();
+            return;
+          }
+          const currentCfg = ConfigStorage.load();
+          if (!currentCfg.workerUrl) {
+            player.switchToFallback("未配置 Worker，已自动使用系统语音朗读（可点齿轮配置）");
+          }
+          if (!currentChapter || currentChapter.paragraphs.length === 0) {
+            bar.showToast("正在解析小说正文…");
+            const extracted = extractChapterContent(document, window.location.href);
+            if (!extracted || extracted.paragraphs.length === 0) {
+              bar.showToast("未识别到小说正文，无法播放");
+              return;
+            }
+            currentChapter = extracted;
+            nextChapterUrl = extracted.nextChapterUrl;
+            chapterLoader.markVisited(window.location.href);
+            bar.updateChapter(extracted.title, extracted.nextChapterUrl);
+          }
+          await player.playChapter(currentChapter);
+        } catch (err) {
+          console.error("[NovelTTS] Play error:", err);
+          bar.showToast(`播放失败: ${(err == null ? void 0 : err.message) || err}`);
+        } finally {
+          isActionPending = false;
         }
-        if (!config.workerUrl) {
-          bar.showToast("未配置 Worker，将自动使用系统语音试听（可点右上角齿轮配置）");
-        }
-        await player.playChapter(currentChapter);
       },
       onNextSentence: () => {
         player.nextSentence();
@@ -3609,7 +4109,7 @@
         player.previousSentence();
       },
       onNextChapter: () => {
-        handleAutoNextChapter();
+        handleAutoNextChapter(true);
       },
       onRateChange: (rate) => {
         player.setRate(rate);
@@ -3625,14 +4125,20 @@
         player.setProvider(workerProvider);
         bar.showToast("配置已保存并生效");
       },
+      onTestConfig: async (workerUrl, token) => {
+        return await workerProvider.testConnection(workerUrl, token);
+      },
       onJumpChapterUrl: (url) => {
         window.location.href = url;
+      },
+      onBallPositionChange: (pos) => {
+        ConfigStorage.save({ ballPosition: pos });
       }
     });
     const mountUI = () => {
-      bar.mount(document.body);
+      bar.mount(document.documentElement || document.body);
     };
-    if (document.body) {
+    if (document.documentElement || document.body) {
       mountUI();
     } else {
       window.addEventListener("DOMContentLoaded", mountUI);

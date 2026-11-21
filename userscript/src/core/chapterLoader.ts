@@ -104,6 +104,143 @@ export class ChapterLoader {
   }
 
   /**
+   * 判断目标章节是否与当前网页同源
+   */
+  private isSameOrigin(targetUrl: string): boolean {
+    try {
+      if (typeof window === 'undefined' || !window.location) return false;
+      const target = new URL(targetUrl);
+      return target.origin === window.location.origin;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 同源通道：通过原生 window.fetch 获取 HTML（保留 Cookie 与防爬凭证）
+   */
+  private async fetchChapterViaNativeFetch(targetUrl: string): Promise<string> {
+    const res = await window.fetch(targetUrl, {
+      method: 'GET',
+      credentials: 'include',
+      headers: {
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+    });
+
+    if (!res.ok) {
+      throw new Error(`同源 fetch 失败, HTTP ${res.status}`);
+    }
+
+    const buffer = await res.arrayBuffer();
+    if (!buffer || buffer.byteLength === 0) {
+      throw new Error('同源 fetch 返回空响应');
+    }
+
+    const contentType = res.headers.get('content-type') || '';
+    const charset = detectCharset(contentType, buffer);
+    try {
+      const decoder = new TextDecoder(charset);
+      return decoder.decode(buffer);
+    } catch {
+      const fallbackDecoder = new TextDecoder('utf-8');
+      return fallbackDecoder.decode(buffer);
+    }
+  }
+
+  /**
+   * 兜底通道：通过 GM_xmlhttpRequest 获取 HTML（带 10000ms JS 超时保险丝）
+   */
+  private async fetchChapterViaGM(targetUrl: string): Promise<string> {
+    const gmRequest = typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null;
+    if (!gmRequest) {
+      throw new Error('GM_xmlhttpRequest 在当前环境中不可用');
+    }
+
+    return new Promise<string>((resolve, reject) => {
+      let settled = false;
+      let requestHandle: { abort?: () => void } | null = null;
+      let timer: any = null;
+
+      const cleanup = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      };
+
+      const finishError = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(err);
+      };
+
+      const finishSuccess = (html: string) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(html);
+      };
+
+      // 10000ms JS 硬超时保险丝
+      timer = setTimeout(() => {
+        try {
+          if (requestHandle && typeof requestHandle.abort === 'function') {
+            requestHandle.abort();
+          }
+        } catch {
+          // ignore
+        }
+        finishError(new Error('请求超时 (10000ms JS 保险丝触发)'));
+      }, 10000);
+
+      try {
+        const headers: Record<string, string> = {
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        };
+        if (typeof window !== 'undefined' && window.location?.href) {
+          headers['Referer'] = window.location.href;
+        }
+
+        requestHandle = gmRequest({
+          method: 'GET',
+          url: targetUrl,
+          responseType: 'arraybuffer',
+          anonymous: false, // 附带 Cookie
+          headers,
+          timeout: 10000,
+          onload: (resp) => {
+            if (resp.status < 200 || resp.status >= 300) {
+              finishError(new Error(`抓取下一章失败, HTTP ${resp.status}`));
+              return;
+            }
+
+            const buffer = resp.response as ArrayBuffer;
+            if (!buffer || buffer.byteLength === 0) {
+              finishError(new Error('抓取下一章返回空内容'));
+              return;
+            }
+
+            const charset = detectCharset(resp.responseHeaders || '', buffer);
+            try {
+              const decoder = new TextDecoder(charset);
+              finishSuccess(decoder.decode(buffer));
+            } catch {
+              const fallbackDecoder = new TextDecoder('utf-8');
+              finishSuccess(fallbackDecoder.decode(buffer));
+            }
+          },
+          onerror: (err) => finishError(new Error(`网络错误 (GM_xhr): ${JSON.stringify(err)}`)),
+          ontimeout: () => finishError(new Error('抓取下一章网络超时 (10000ms)')),
+        });
+      } catch (invokeErr: any) {
+        finishError(new Error(`GM_xmlhttpRequest 触发失败: ${invokeErr?.message || invokeErr}`));
+      }
+    });
+  }
+
+  /**
    * 静默拉取指定章节的 HTML 并解析正文
    * @param targetUrl 下一章完整 URL
    */
@@ -120,44 +257,22 @@ export class ChapterLoader {
       return null;
     }
 
-    const gmRequest = typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null;
-    if (!gmRequest) {
-      throw new Error('GM_xmlhttpRequest is not available for chapter loading');
+    let html: string | null = null;
+
+    // 1. 若同源，优先使用原生 fetch（保留完整 Cookie 和防爬验证）
+    if (this.isSameOrigin(targetUrl) && typeof window.fetch === 'function') {
+      try {
+        html = await this.fetchChapterViaNativeFetch(targetUrl);
+      } catch (fetchErr) {
+        console.warn('[NovelTTS] 同源 fetch 失败，回退至 GM_xmlhttpRequest:', fetchErr);
+        // 回退至 GM_xmlhttpRequest
+      }
     }
 
-    const html = await new Promise<string>((resolve, reject) => {
-      gmRequest({
-        method: 'GET',
-        url: targetUrl,
-        responseType: 'arraybuffer',
-        timeout: 10000,
-        onload: (resp) => {
-          if (resp.status < 200 || resp.status >= 300) {
-            reject(new Error(`Failed to fetch chapter, HTTP ${resp.status}`));
-            return;
-          }
-
-          const buffer = resp.response as ArrayBuffer;
-          if (!buffer || buffer.byteLength === 0) {
-            reject(new Error('Received empty response for chapter'));
-            return;
-          }
-
-          const charset = detectCharset(resp.responseHeaders || '', buffer);
-          try {
-            const decoder = new TextDecoder(charset);
-            const decoded = decoder.decode(buffer);
-            resolve(decoded);
-          } catch (decodeErr) {
-            // 解码失败尝试 utf-8 兜底
-            const fallbackDecoder = new TextDecoder('utf-8');
-            resolve(fallbackDecoder.decode(buffer));
-          }
-        },
-        onerror: (err) => reject(new Error(`Network error loading chapter: ${JSON.stringify(err)}`)),
-        ontimeout: () => reject(new Error('Timed out loading next chapter')),
-      });
-    });
+    // 2. 跨域或同源 fetch 失败后，使用 GM_xmlhttpRequest
+    if (!html) {
+      html = await this.fetchChapterViaGM(targetUrl);
+    }
 
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, 'text/html');
