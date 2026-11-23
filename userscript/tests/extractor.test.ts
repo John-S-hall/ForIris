@@ -101,6 +101,56 @@ describe('extractor.ts - 正文与下一章链接提取引擎', () => {
     expect(content.nextChapterUrl).toBeNull();
   });
 
+  it('文本密度兜底：无 article/section 时选中内层纯正文 div 而非外层包含导航的大 wrapper', () => {
+    const html = `
+      <!DOCTYPE html>
+      <html>
+        <head><title>第十章 密林</title></head>
+        <body>
+          <div class="page-wrapper">
+            <div class="top-links">
+              <a href="/1">玄幻</a><a href="/2">都市</a><a href="/3">历史</a><a href="/4">排行</a>
+              <a href="/5">完本</a><a href="/6">书架</a><a href="/7">推荐</a><a href="/8">首页</a>
+            </div>
+            <div class="novel-body-inner">
+              风声在幽暗的林间穿梭，树影摇曳不定，仿佛暗夜中潜伏着无数双窥探的眼睛。<br/>
+              李昂停下脚步，屏住呼吸仔细聆听四周传来的细微动静，不敢有丝毫大意。
+            </div>
+          </div>
+        </body>
+      </html>
+    `;
+    const dom = new JSDOM(html, { url: 'https://example.com/10.html' });
+    const content = extractChapterContent(dom.window.document, 'https://example.com/10.html');
+
+    expect(content.paragraphs.some((p) => p.includes('风声在幽暗的林间穿梭'))).toBe(true);
+    expect(content.paragraphs.some((p) => p.includes('玄幻'))).toBe(false);
+  });
+
+  it('下一章链接识别：支持带空格的 "下 一 章"，且页底评论区 "下一页" 不覆盖正文 "下一章"', () => {
+    const html = `
+      <!DOCTYPE html>
+      <html>
+        <body>
+          <div id="content">正文内容测试正文内容测试正文内容测试正文内容测试正文内容测试</div>
+          <div class="chapter-nav">
+            <a href="/book/2.html">下 一 章</a>
+          </div>
+          <div id="comments">
+            <a href="/book/1?commentPage=2">下一页</a>
+          </div>
+          <div class="footer-links">
+            <a href="/other?page=2">下一页</a>
+          </div>
+        </body>
+      </html>
+    `;
+    const dom = new JSDOM(html, { url: 'https://example.com/book/1.html' });
+    const nextUrl = extractNextChapterUrl(dom.window.document, 'https://example.com/book/1.html');
+
+    expect(nextUrl).toBe('https://example.com/book/2.html');
+  });
+
   it('下一章链接防御：忽略指向当前 URL 的自环链接', () => {
     const html = `
       <!DOCTYPE html>
@@ -117,7 +167,7 @@ describe('extractor.ts - 正文与下一章链接提取引擎', () => {
     expect(nextUrl).toBeNull();
   });
 
-  it('下一章链接防御：过滤 javascript 伪协议和锚点链接', () => {
+  it('下一章链接防御：过滤 javascript 伪协议和锚点链接并继续匹配后续合法链接', () => {
     const html = `
       <!DOCTYPE html>
       <html>
@@ -125,12 +175,13 @@ describe('extractor.ts - 正文与下一章链接提取引擎', () => {
           <div id="content">正文内容测试正文内容测试正文内容测试正文内容测试正文内容测试</div>
           <a href="javascript:void(0);">下一章</a>
           <a href="#">下页</a>
+          <a href="/chapter_2.html">下一章</a>
         </body>
       </html>
     `;
     const dom = new JSDOM(html, { url: 'https://example.com/chapter_1.html' });
     const nextUrl = extractNextChapterUrl(dom.window.document, 'https://example.com/chapter_1.html');
 
-    expect(nextUrl).toBeNull();
+    expect(nextUrl).toBe('https://example.com/chapter_2.html');
   });
 });

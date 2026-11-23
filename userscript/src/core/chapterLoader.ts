@@ -8,14 +8,15 @@ export function detectCharset(headers: Record<string, string> | string, buffer: 
   // 1. 尝试从响应头中解析
   let headerCharset = '';
   if (typeof headers === 'string') {
-    const match = headers.match(/charset=([a-zA-Z0-9_-]+)/i);
-    if (match) headerCharset = match[1].toLowerCase();
+    const ctMatch = headers.match(/content-type:[^\r\n]*charset=([a-zA-Z0-9_-]+)/i);
+    if (ctMatch) {
+      headerCharset = ctMatch[1].toLowerCase();
+    } else {
+      const match = headers.match(/charset=([a-zA-Z0-9_-]+)/i);
+      if (match) headerCharset = match[1].toLowerCase();
+    }
   } else if (headers && typeof headers === 'object') {
-    const contentType =
-      headers['content-type'] ||
-      headers['Content-Type'] ||
-      headers['content-type'.toLowerCase()] ||
-      '';
+    const contentType = headers['content-type'] || headers['Content-Type'] || '';
     const match = contentType.match(/charset=([a-zA-Z0-9_-]+)/i);
     if (match) headerCharset = match[1].toLowerCase();
   }
@@ -56,6 +57,32 @@ function normalizeEncoding(enc: string): string {
     return 'utf-8';
   }
   return enc;
+}
+
+async function normalizeArrayBuffer(rawResponse: unknown): Promise<ArrayBuffer> {
+  let buffer: ArrayBuffer | null = null;
+
+  if (rawResponse instanceof ArrayBuffer) {
+    buffer = rawResponse;
+  } else if (ArrayBuffer.isView(rawResponse)) {
+    const copy = new Uint8Array(rawResponse.byteLength);
+    copy.set(
+      new Uint8Array(
+        rawResponse.buffer as ArrayBuffer,
+        rawResponse.byteOffset,
+        rawResponse.byteLength
+      )
+    );
+    buffer = copy.buffer;
+  } else if (typeof Blob !== 'undefined' && rawResponse instanceof Blob) {
+    buffer = await rawResponse.arrayBuffer();
+  }
+
+  if (!buffer || buffer.byteLength === 0) {
+    throw new Error('抓取下一章返回空内容');
+  }
+
+  return buffer;
 }
 
 export class ChapterLoader {
@@ -117,34 +144,56 @@ export class ChapterLoader {
   }
 
   /**
-   * 同源通道：通过原生 window.fetch 获取 HTML（保留 Cookie 与防爬凭证）
+   * 同源通道：通过原生 window.fetch 获取 HTML（保留 Cookie 与防爬凭证，含 10000ms 超时）
    */
   private async fetchChapterViaNativeFetch(targetUrl: string): Promise<string> {
-    const res = await window.fetch(targetUrl, {
-      method: 'GET',
-      credentials: 'include',
-      headers: {
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      },
-    });
+    const timeoutController = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      timeoutController.abort();
+    }, 10000);
 
-    if (!res.ok) {
-      throw new Error(`同源 fetch 失败, HTTP ${res.status}`);
-    }
-
-    const buffer = await res.arrayBuffer();
-    if (!buffer || buffer.byteLength === 0) {
-      throw new Error('同源 fetch 返回空响应');
-    }
-
-    const contentType = res.headers.get('content-type') || '';
-    const charset = detectCharset(contentType, buffer);
     try {
-      const decoder = new TextDecoder(charset);
-      return decoder.decode(buffer);
-    } catch {
-      const fallbackDecoder = new TextDecoder('utf-8');
-      return fallbackDecoder.decode(buffer);
+      const fetchInit: RequestInit = {
+        method: 'GET',
+        credentials: 'include',
+        headers: {
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
+        signal: timeoutController.signal,
+      };
+      if (typeof window !== 'undefined' && window.location?.href) {
+        fetchInit.referrer = window.location.href;
+      }
+
+      const res = await window.fetch(targetUrl, fetchInit);
+
+      if (!res.ok) {
+        throw new Error(`同源 fetch 失败, HTTP ${res.status}`);
+      }
+
+      const buffer = await res.arrayBuffer();
+      if (!buffer || buffer.byteLength === 0) {
+        throw new Error('同源 fetch 返回空响应');
+      }
+
+      const contentType = res.headers?.get('content-type') || '';
+      const charset = detectCharset(contentType, buffer);
+      try {
+        const decoder = new TextDecoder(charset);
+        return decoder.decode(buffer);
+      } catch {
+        const fallbackDecoder = new TextDecoder('utf-8');
+        return fallbackDecoder.decode(buffer);
+      }
+    } catch (err) {
+      if (timedOut) {
+        throw new Error('同源 fetch 抓取下一章超时 (10000ms)');
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -160,7 +209,7 @@ export class ChapterLoader {
     return new Promise<string>((resolve, reject) => {
       let settled = false;
       let requestHandle: { abort?: () => void } | null = null;
-      let timer: any = null;
+      let timer: ReturnType<typeof setTimeout> | null = null;
 
       const cleanup = () => {
         if (timer) {
@@ -210,25 +259,24 @@ export class ChapterLoader {
           anonymous: false, // 附带 Cookie
           headers,
           timeout: 10000,
-          onload: (resp) => {
+          onload: async (resp) => {
             if (resp.status < 200 || resp.status >= 300) {
               finishError(new Error(`抓取下一章失败, HTTP ${resp.status}`));
               return;
             }
 
-            const buffer = resp.response as ArrayBuffer;
-            if (!buffer || buffer.byteLength === 0) {
-              finishError(new Error('抓取下一章返回空内容'));
-              return;
-            }
-
-            const charset = detectCharset(resp.responseHeaders || '', buffer);
             try {
-              const decoder = new TextDecoder(charset);
-              finishSuccess(decoder.decode(buffer));
-            } catch {
-              const fallbackDecoder = new TextDecoder('utf-8');
-              finishSuccess(fallbackDecoder.decode(buffer));
+              const buffer = await normalizeArrayBuffer(resp.response);
+              const charset = detectCharset(resp.responseHeaders || '', buffer);
+              try {
+                const decoder = new TextDecoder(charset);
+                finishSuccess(decoder.decode(buffer));
+              } catch {
+                const fallbackDecoder = new TextDecoder('utf-8');
+                finishSuccess(fallbackDecoder.decode(buffer));
+              }
+            } catch (err: any) {
+              finishError(err instanceof Error ? err : new Error(String(err)));
             }
           },
           onerror: (err) => finishError(new Error(`网络错误 (GM_xhr): ${JSON.stringify(err)}`)),
@@ -258,19 +306,23 @@ export class ChapterLoader {
     }
 
     let html: string | null = null;
+    let nativeFetchError: Error | null = null;
 
     // 1. 若同源，优先使用原生 fetch（保留完整 Cookie 和防爬验证）
     if (this.isSameOrigin(targetUrl) && typeof window.fetch === 'function') {
       try {
         html = await this.fetchChapterViaNativeFetch(targetUrl);
-      } catch (fetchErr) {
+      } catch (fetchErr: any) {
+        nativeFetchError = fetchErr instanceof Error ? fetchErr : new Error(String(fetchErr));
         console.warn('[NovelTTS] 同源 fetch 失败，回退至 GM_xmlhttpRequest:', fetchErr);
-        // 回退至 GM_xmlhttpRequest
       }
     }
 
     // 2. 跨域或同源 fetch 失败后，使用 GM_xmlhttpRequest
     if (!html) {
+      if (nativeFetchError && typeof GM_xmlhttpRequest !== 'function') {
+        throw nativeFetchError;
+      }
       html = await this.fetchChapterViaGM(targetUrl);
     }
 
@@ -280,8 +332,10 @@ export class ChapterLoader {
     // 提取正文与新的下一章链接
     const content = extractChapterContent(doc, targetUrl);
 
-    // 标记当前章节为已访问
-    this.visitedUrls.add(normalized);
+    // 仅在提取到有效正文时才记录已访问，避免防爬挑战空页污染 visitedUrls
+    if (content.paragraphs.length > 0) {
+      this.visitedUrls.add(normalized);
+    }
 
     return content;
   }

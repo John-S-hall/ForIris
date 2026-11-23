@@ -36,7 +36,7 @@ export class WebSpeechEngine {
       this.currentUtterance = utterance;
 
       // 语速倍率：SpeechSynthesis 的 rate 范围一般是 0.1 ~ 10，默认 1.0
-      utterance.rate = Math.max(0.5, Math.min(2.5, options.rate || 1.2));
+      utterance.rate = Math.max(0.5, Math.min(2.5, options.rate || 1.0));
       utterance.lang = 'zh-CN';
 
       utterance.onstart = () => {

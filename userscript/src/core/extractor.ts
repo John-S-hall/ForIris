@@ -16,8 +16,20 @@ const NOVEL_CONTENT_SELECTORS = [
   '.chapter-content',
 ];
 
-/** 下一章链接正则匹配 */
-const NEXT_CHAPTER_REGEX = /^(?:下一[章页]|下页|下一话)$|下一章|下一页|下页/;
+/** 下一章链接干扰词过滤 */
+const NEXT_CHAPTER_EXCLUDE_REGEX = /(?:上一|目录|书架|书签|推荐|预告|催更|评论|投票)/;
+
+/** Tier 1 精确下一章文字 */
+const NEXT_CHAPTER_TIER1_REGEX = /^(?:下一[章节回话]|下章|后一章|nextchapter)[→>»›]*$/i;
+
+/** Tier 2 下一页文字 */
+const NEXT_CHAPTER_TIER2_REGEX = /^(?:下一页|下页|nextpage|next)[→>»›]*$/i;
+
+/** Tier 3 模糊包含 */
+const NEXT_CHAPTER_TIER3_REGEX = /(?:下一章|下一页|下页|下一节|下章)/;
+
+/** 非法/非导航链接协议 */
+const INVALID_HREF_PROTOCOL_REGEX = /^(?:javascript|mailto|tel):/i;
 
 /** 噪音节点标签名（大写） */
 const NOISE_TAGS = new Set([
@@ -104,9 +116,41 @@ function extractParagraphsFromElement(element: Element): string[] {
 }
 
 /**
+ * 统计节点内非链接文本与链接文本的有效字符数（跳过噪音标签）
+ */
+function measureTextStats(el: Element): { nonLinkChars: number; linkChars: number } {
+  let nonLinkChars = 0;
+  let linkChars = 0;
+
+  const walk = (node: Node, inLink: boolean) => {
+    if (node.nodeType === 3) {
+      const len = (node.nodeValue || '').replace(/\s+/g, '').length;
+      if (inLink) {
+        linkChars += len;
+      } else {
+        nonLinkChars += len;
+      }
+      return;
+    }
+    if (node.nodeType !== 1) return;
+
+    const elem = node as Element;
+    if (NOISE_TAGS.has(elem.tagName)) return;
+
+    const nextInLink = inLink || elem.tagName === 'A';
+    for (let i = 0; i < elem.childNodes.length; i++) {
+      walk(elem.childNodes[i], nextInLink);
+    }
+  };
+
+  walk(el, el.tagName === 'A');
+  return { nonLinkChars, linkChars };
+}
+
+/**
  * 启发式查找正文容器：
  * 1. 优先尝试已知的小说常见容器 ID / class
- * 2. 兜底采用最大文本密度容器算法
+ * 2. 兜底采用最大文本密度容器算法（过滤导航目录、优先最精准内层正文块）
  */
 function findFallbackContentElement(doc: Document): Element | null {
   // 1. 优先选择器检测
@@ -121,34 +165,50 @@ function findFallbackContentElement(doc: Document): Element | null {
   }
 
   // 2. 最大文本密度候选查找 (遍历 div, article, section)
-  const candidates = doc.querySelectorAll('article, section, div');
+  const candidates = Array.from(doc.querySelectorAll('article, section, div'));
   let bestElement: Element | null = null;
-  let maxTextLength = 0;
+  let maxNonLinkLength = 0;
 
-  candidates.forEach((cand) => {
-    if (NOISE_TAGS.has(cand.tagName)) return;
+  for (const cand of candidates) {
+    if (NOISE_TAGS.has(cand.tagName)) continue;
 
     // 排除表单或纯导航容器
     if (cand.querySelector('form, input, button') && !cand.querySelector('p, br')) {
-      return;
+      continue;
     }
 
-    const directTextLength = cand.textContent?.replace(/\s+/g, '').length || 0;
-    if (directTextLength > maxTextLength) {
-      const innerBlocks = cand.querySelectorAll('article, section');
-      if (innerBlocks.length === 0) {
-        maxTextLength = directTextLength;
-        bestElement = cand;
-      }
+    const stats = measureTextStats(cand);
+    const totalChars = stats.nonLinkChars + stats.linkChars;
+    if (totalChars === 0 || stats.nonLinkChars < MIN_CONTENT_CHAR_THRESHOLD) {
+      continue;
     }
-  });
 
-  // 只有当最大文本密度容器字数达到阈值时才返回
-  if (maxTextLength >= MIN_CONTENT_CHAR_THRESHOLD) {
-    return bestElement;
+    // 跳过链接文字占比超过 45% 的导航/目录/推荐容器
+    if (stats.linkChars / totalChars > 0.45) {
+      continue;
+    }
+
+    // 若存在内层子块承载了 >= 80% 的非链接文本，说明当前是外层包裹壳，跳过外层让内层胜出
+    const innerBlocks = Array.from(cand.querySelectorAll('div, article, section'));
+    const hasTighterInnerBlock = innerBlocks.some((child) => {
+      if (NOISE_TAGS.has(child.tagName)) return false;
+      const childStats = measureTextStats(child);
+      const childTotal = childStats.nonLinkChars + childStats.linkChars;
+      if (childTotal === 0 || childStats.linkChars / childTotal > 0.45) return false;
+      return childStats.nonLinkChars >= stats.nonLinkChars * 0.8;
+    });
+
+    if (hasTighterInnerBlock) {
+      continue;
+    }
+
+    if (stats.nonLinkChars > maxNonLinkLength) {
+      maxNonLinkLength = stats.nonLinkChars;
+      bestElement = cand;
+    }
   }
 
-  return null;
+  return maxNonLinkLength >= MIN_CONTENT_CHAR_THRESHOLD ? bestElement : null;
 }
 
 /**
@@ -176,53 +236,20 @@ function extractFallbackTitle(doc: Document): string {
 }
 
 /**
- * 提取下一章完整绝对 URL
+ * 解析并校验下一章绝对 URL（过滤非法协议与当前页自环）
  */
-export function extractNextChapterUrl(doc: Document, currentUrl?: string): string | null {
-  const baseUrl = currentUrl || doc.baseURI || 'http://localhost';
-  let currentParsed: URL | null = null;
+function resolveValidNextUrl(
+  rawHref: string,
+  resolveBaseUrl: string,
+  currentParsed: URL | null
+): string | null {
   try {
-    currentParsed = new URL(baseUrl);
-  } catch {
-    // baseUrl 解析失败
-  }
+    const absolute = new URL(rawHref, resolveBaseUrl);
 
-  const links = Array.from(doc.querySelectorAll('a'));
-  let matchedHref: string | null = null;
-
-  // 倒序遍历（通常移动端或PC端的小说翻页栏位于正文底部）
-  for (let i = links.length - 1; i >= 0; i--) {
-    const link = links[i];
-    const text = cleanLine(link.textContent || '');
-    const title = cleanLine(link.getAttribute('title') || '');
-
-    // 匹配下一章/下一页/下页，排除“上一章/上一页”
-    if (
-      (NEXT_CHAPTER_REGEX.test(text) || NEXT_CHAPTER_REGEX.test(title)) &&
-      !text.includes('上一') &&
-      !title.includes('上一')
-    ) {
-      const rawHref = link.getAttribute('href');
-      if (rawHref && rawHref.trim() && !rawHref.startsWith('javascript:') && rawHref !== '#') {
-        matchedHref = rawHref.trim();
-        break;
-      }
-    }
-  }
-
-  if (!matchedHref) {
-    return null;
-  }
-
-  try {
-    const absolute = new URL(matchedHref, baseUrl);
-
-    // 防死循环边界判断：仅允许 http/https 协议
     if (!['http:', 'https:'].includes(absolute.protocol)) {
       return null;
     }
 
-    // 若解析出的 URL 指向当前页本身（忽略 hash 后完全一致），视为无效链接
     if (currentParsed) {
       const currentNoHash = `${currentParsed.origin}${currentParsed.pathname}${currentParsed.search}`;
       const targetNoHash = `${absolute.origin}${absolute.pathname}${absolute.search}`;
@@ -235,6 +262,85 @@ export function extractNextChapterUrl(doc: Document, currentUrl?: string): strin
   } catch {
     return null;
   }
+}
+
+/**
+ * 提取下一章完整绝对 URL（分级打分 + 评论区隔离 + 空格归一化）
+ */
+export function extractNextChapterUrl(doc: Document, currentUrl?: string): string | null {
+  const pageUrl = currentUrl || doc.baseURI || 'http://localhost';
+  let currentParsed: URL | null = null;
+  try {
+    currentParsed = new URL(pageUrl);
+  } catch {
+    // pageUrl 解析失败
+  }
+
+  // 若页面存在 <base href="...">，相对路径基于 <base> 解析
+  let resolveBaseUrl = pageUrl;
+  const baseElHref = doc.querySelector('base[href]')?.getAttribute('href')?.trim();
+  if (baseElHref) {
+    try {
+      resolveBaseUrl = new URL(baseElHref, pageUrl).href;
+    } catch {
+      // ignore invalid base
+    }
+  }
+
+  const links = Array.from(doc.querySelectorAll('a'));
+  let bestScore = 0;
+  let bestUrl: string | null = null;
+
+  for (const link of links) {
+    const rawHref = link.getAttribute('href')?.trim() || '';
+    if (!rawHref || rawHref === '#' || INVALID_HREF_PROTOCOL_REGEX.test(rawHref)) {
+      continue;
+    }
+
+    // 排除评论区/回复区/推荐区翻页链接
+    if (link.closest('.comment, #comments, .comments, .reply, .recommend')) {
+      continue;
+    }
+
+    const compactText = cleanLine(link.textContent || '').replace(/\s+/g, '');
+    const compactTitle = cleanLine(link.getAttribute('title') || '').replace(/\s+/g, '');
+
+    if (
+      NEXT_CHAPTER_EXCLUDE_REGEX.test(compactText) ||
+      NEXT_CHAPTER_EXCLUDE_REGEX.test(compactTitle)
+    ) {
+      continue;
+    }
+
+    const isKnownNextSelector =
+      link.getAttribute('rel')?.toLowerCase() === 'next' ||
+      link.matches('#pb_next, #next_url, #pt_next, #nextchapter, #linkNext, a.next-chapter');
+
+    let score = 0;
+    if (NEXT_CHAPTER_TIER1_REGEX.test(compactText) || isKnownNextSelector) {
+      score = 100;
+    } else if (NEXT_CHAPTER_TIER2_REGEX.test(compactText)) {
+      score = 70;
+    } else if (
+      (NEXT_CHAPTER_TIER3_REGEX.test(compactText) && compactText.length <= 16) ||
+      (NEXT_CHAPTER_TIER3_REGEX.test(compactTitle) && compactTitle.length <= 16)
+    ) {
+      score = 40;
+    }
+
+    if (score === 0) continue;
+
+    const resolvedUrl = resolveValidNextUrl(rawHref, resolveBaseUrl, currentParsed);
+    if (!resolvedUrl) continue;
+
+    // 同级取 DOM 中位置更靠后者（移动端常见底部翻页栏优先）
+    if (score >= bestScore) {
+      bestScore = score;
+      bestUrl = resolvedUrl;
+    }
+  }
+
+  return bestUrl;
 }
 
 /**

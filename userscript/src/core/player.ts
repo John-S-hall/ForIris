@@ -17,6 +17,11 @@ export interface PlayerConfig {
   events?: PlayerEvents;
 }
 
+export interface UnlockOptions {
+  audio?: boolean;
+  speech?: boolean;
+}
+
 interface CacheItem {
   blobUrl?: string;
   promise?: Promise<string>;
@@ -33,9 +38,14 @@ export class NovelPlayer {
   private webSpeechEngine: WebSpeechEngine;
   private isUsingFallback = false;
 
-  // 单例音频实例
+  // 单例音频实例与解锁状态
   private audio: HTMLAudioElement;
   private isAudioUnlocked = false;
+  private isSpeechUnlocked = false;
+
+  // 异步竞态控制与重试定时器
+  private playToken = 0;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
 
   // 章节与句子队列
   private currentChapter: ChapterContent | null = null;
@@ -61,7 +71,7 @@ export class NovelPlayer {
   constructor(config: PlayerConfig) {
     this.provider = config.provider;
     this.voice = config.voice || 'zh-CN-XiaoxiaoNeural';
-    this.rate = config.rate || 1.2;
+    this.rate = config.rate ?? 1.0;
     this.events = config.events || {};
     this.webSpeechEngine = new WebSpeechEngine();
 
@@ -94,10 +104,23 @@ export class NovelPlayer {
   }
 
   setProvider(provider: TTSProvider): void {
+    const wasActive = this.state === 'playing' || this.state === 'loading';
+    const wasFallback = this.isUsingFallback;
+
     this.provider = provider;
     this.isUsingFallback = false;
     this.consecutiveFailures = 0;
+    this.clearRetryTimer();
     this.clearPrefetchCache();
+
+    if (wasActive) {
+      if (wasFallback) {
+        this.webSpeechEngine.cancel();
+      } else if (this.audio && typeof this.audio.pause === 'function') {
+        this.audio.pause();
+      }
+      void this.playCurrentSentence();
+    }
   }
 
   switchToFallback(reason?: string): void {
@@ -115,52 +138,74 @@ export class NovelPlayer {
     this.updateMediaSessionState();
   }
 
+  private clearRetryTimer(): void {
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+  }
+
   // ─── 音频事件与同步解锁 ──────────────────────────────────────────────────
 
   private setupAudioListeners(): void {
     if (!this.audio || typeof this.audio.addEventListener !== 'function') return;
 
     this.audio.addEventListener('ended', () => {
+      if (this.state !== 'playing' || !this.audio.src || this.audio.src === SILENT_AUDIO_WAV) {
+        return;
+      }
       this.handleSentenceEnd();
     });
 
     this.audio.addEventListener('error', () => {
-      if (this.state === 'playing') {
-        this.handlePlaybackFailure(new Error('Audio playback error'));
+      if (this.state !== 'playing' || !this.audio.src || this.audio.src === SILENT_AUDIO_WAV) {
+        return;
       }
+      void this.handlePlaybackFailure(new Error('Audio playback error'), this.playToken);
     });
   }
 
   /**
    * 同步解锁函数：必须在播放手势的第一行同步调用
-   * 一次性同步解锁：1) <audio> 实例；2) window.speechSynthesis
+   * 幂等解锁：1) <audio> 实例；2) window.speechSynthesis
    */
-  unlockAllAudio(): void {
+  unlockAllAudio(opts: UnlockOptions = {}): void {
+    const unlockAudio = opts.audio ?? true;
+    const unlockSpeech = opts.speech ?? true;
+
     // 1. 同步解锁单例 HTMLAudioElement
-    if (this.audio && typeof this.audio.play === 'function') {
+    if (
+      unlockAudio &&
+      !this.isAudioUnlocked &&
+      this.audio &&
+      typeof this.audio.play === 'function'
+    ) {
       try {
         if (!this.audio.src || this.audio.src === '' || this.audio.src === SILENT_AUDIO_WAV) {
           this.audio.src = SILENT_AUDIO_WAV;
-        }
-        const playPromise = this.audio.play();
-        if (playPromise && typeof playPromise.then === 'function') {
-          playPromise
-            .then(() => {
-              this.isAudioUnlocked = true;
-            })
-            .catch(() => {
-              // 忽略静音测试播放错误
-            });
-        } else {
           this.isAudioUnlocked = true;
+          const playPromise = this.audio.play();
+          if (playPromise && typeof playPromise.then === 'function') {
+            playPromise
+              .then(() => {
+                this.isAudioUnlocked = true;
+              })
+              .catch((err: any) => {
+                if (err?.name === 'NotAllowedError') {
+                  this.isAudioUnlocked = false;
+                }
+              });
+          }
         }
       } catch {
-        // 忽略
+        this.isAudioUnlocked = false;
       }
     }
 
     // 2. 同步解锁 window.speechSynthesis
     if (
+      unlockSpeech &&
+      !this.isSpeechUnlocked &&
       typeof window !== 'undefined' &&
       'speechSynthesis' in window &&
       typeof SpeechSynthesisUtterance !== 'undefined'
@@ -169,8 +214,9 @@ export class NovelPlayer {
         const dummyUtterance = new SpeechSynthesisUtterance('');
         dummyUtterance.volume = 0;
         window.speechSynthesis.speak(dummyUtterance);
+        this.isSpeechUnlocked = true;
       } catch {
-        // 忽略
+        this.isSpeechUnlocked = false;
       }
     }
   }
@@ -274,6 +320,28 @@ export class NovelPlayer {
   }
 
   /**
+   * 仅清理未来预取缓存（保留当前正在播放句的 Blob URL，防止中断）
+   */
+  private clearFuturePrefetchCache(): void {
+    this.prefetchCache.forEach((item, key) => {
+      if (key === this.currentIndex) return;
+      try {
+        item.abortController.abort();
+      } catch {
+        // 忽略
+      }
+      if (item.blobUrl) {
+        try {
+          URL.revokeObjectURL(item.blobUrl);
+        } catch {
+          // 忽略
+        }
+      }
+      this.prefetchCache.delete(key);
+    });
+  }
+
+  /**
    * 释放单条已播放完毕或无用的缓存
    */
   private revokeCacheItem(index: number): void {
@@ -305,10 +373,10 @@ export class NovelPlayer {
     const next2 = this.currentIndex + 2;
 
     if (next1 < this.sentences.length) {
-      this.fetchSentenceBlob(next1);
+      this.fetchSentenceBlob(next1).catch(() => {});
     }
     if (next2 < this.sentences.length) {
-      this.fetchSentenceBlob(next2);
+      this.fetchSentenceBlob(next2).catch(() => {});
     }
 
     // 硬限制：清理超出当前视野的过期缓存，确保总数 <= MAX_CACHE_SIZE
@@ -323,7 +391,7 @@ export class NovelPlayer {
    * 获取或并发请求指定句子的音频 Blob URL
    */
   private async fetchSentenceBlob(index: number): Promise<string> {
-    if (index >= this.sentences.length) {
+    if (index < 0 || index >= this.sentences.length) {
       throw new Error(`Sentence index out of range: ${index}`);
     }
 
@@ -350,32 +418,46 @@ export class NovelPlayer {
       signal: abortController.signal,
     };
 
+    const item: CacheItem = { abortController };
+
     const promise = (async () => {
-      let lastError: Error | null = null;
-      // 失败重试 1 次规则
-      for (let attempt = 0; attempt < 2; attempt++) {
-        if (abortController.signal.aborted) {
-          throw new DOMException('Aborted', 'AbortError');
-        }
-        try {
-          const blobUrl = await this.provider.synthesize(text, options);
-          const item = this.prefetchCache.get(index);
-          if (item) {
-            item.blobUrl = blobUrl;
+      try {
+        let lastError: Error | null = null;
+        // 失败重试 1 次规则
+        for (let attempt = 0; attempt < 2; attempt++) {
+          if (abortController.signal.aborted) {
+            throw new DOMException('Aborted', 'AbortError');
           }
-          return blobUrl;
-        } catch (err: any) {
-          if (err.name === 'AbortError') throw err;
-          lastError = err instanceof Error ? err : new Error(String(err));
+          try {
+            const blobUrl = await this.provider.synthesize(text, options);
+            // 若在合成完成前缓存已被撤销/替换，立即释放刚创建的 Blob URL 防止泄漏
+            if (abortController.signal.aborted || this.prefetchCache.get(index) !== item) {
+              try {
+                URL.revokeObjectURL(blobUrl);
+              } catch {
+                // ignore
+              }
+              throw new DOMException('Aborted', 'AbortError');
+            }
+            item.blobUrl = blobUrl;
+            return blobUrl;
+          } catch (err: any) {
+            if (err?.name === 'AbortError') throw err;
+            lastError = err instanceof Error ? err : new Error(String(err));
+          }
         }
+        throw lastError || new Error(`Failed to synthesize sentence ${index}`);
+      } catch (err) {
+        // 彻底删除失败/取消项，避免下次重用已失败 Promise（防缓存投毒）
+        if (this.prefetchCache.get(index) === item) {
+          this.prefetchCache.delete(index);
+        }
+        throw err;
       }
-      throw lastError || new Error(`Failed to synthesize sentence ${index}`);
     })();
 
-    this.prefetchCache.set(index, {
-      abortController,
-      promise,
-    });
+    item.promise = promise;
+    this.prefetchCache.set(index, item);
 
     return promise;
   }
@@ -386,8 +468,14 @@ export class NovelPlayer {
    * 载入章节并开始播放
    */
   async playChapter(chapter: ChapterContent, startIndex = 0): Promise<void> {
-    this.unlockAllAudio();
-    this.stop();
+    this.clearRetryTimer();
+    this.playToken++;
+
+    if (this.state !== 'idle') {
+      this.stop();
+    } else {
+      this.clearPrefetchCache();
+    }
 
     this.currentChapter = chapter;
     this.sentences = chunkText(chapter.paragraphs);
@@ -406,6 +494,9 @@ export class NovelPlayer {
    * 播放当前索引所指向的句子
    */
   private async playCurrentSentence(): Promise<void> {
+    this.clearRetryTimer();
+    const token = ++this.playToken;
+
     if (this.currentIndex >= this.sentences.length) {
       this.handleChapterEnd();
       return;
@@ -428,19 +519,29 @@ export class NovelPlayer {
     // 2. 正常 Edge Worker 播放流程
     try {
       const blobUrl = await this.fetchSentenceBlob(this.currentIndex);
-      if (this.state !== 'loading') {
-        // 如果在获取音频期间用户已暂停或停止
+      if (token !== this.playToken || this.state !== 'loading') {
         return;
       }
 
+      // Edge Worker 已通过 SSML 合成目标语速，playbackRate 始终固定为 1.0
+      this.audio.playbackRate = 1.0;
       this.audio.src = blobUrl;
       const playPromise = this.audio.play();
       if (playPromise && typeof playPromise.then === 'function') {
         try {
           await playPromise;
         } catch (playErr: any) {
+          if (token !== this.playToken) {
+            try {
+              this.audio.pause();
+            } catch {
+              // ignore
+            }
+            return;
+          }
           // iOS Safari 自动播放拦截处理 (NotAllowedError)
-          if (playErr.name === 'NotAllowedError') {
+          if (playErr?.name === 'NotAllowedError') {
+            this.isAudioUnlocked = false;
             this.setState('paused');
             this.events.onToast?.('请再点一次播放解锁声音');
             return;
@@ -449,38 +550,55 @@ export class NovelPlayer {
         }
       }
 
+      if (token !== this.playToken) {
+        try {
+          this.audio.pause();
+        } catch {
+          // ignore
+        }
+        return;
+      }
+
+      this.isAudioUnlocked = true;
       this.setState('playing');
       this.consecutiveFailures = 0; // 成功播放重置连续错误计数
       await this.requestWakeLock();
 
+      if (token !== this.playToken || this.getState() !== 'playing') {
+        return;
+      }
+
       // 播放成功后并发预取 N+1, N+2
       this.triggerPrefetch();
     } catch (err: any) {
-      if (err.name === 'AbortError') return;
-      await this.handlePlaybackFailure(err);
+      if (token !== this.playToken || err?.name === 'AbortError') return;
+      await this.handlePlaybackFailure(err instanceof Error ? err : new Error(String(err)), token);
     }
   }
 
   /**
    * 单句播放失败与自动降级处理
    */
-  private async handlePlaybackFailure(error: Error): Promise<void> {
+  private async handlePlaybackFailure(error: Error, token: number): Promise<void> {
+    if (token !== this.playToken) return;
+
     this.consecutiveFailures++;
 
     // 若连续 2 句失败，自动无缝降级到 WebSpeech
     if (this.consecutiveFailures >= 2) {
       this.isUsingFallback = true;
       this.clearPrefetchCache();
-      this.events.onToast?.('Edge TTS 连接异常，已自动切换为系统语音朗读');
+      this.events.onToast?.(`Edge TTS 异常 (${error.message})，已自动切换为系统语音朗读`);
       this.playViaWebSpeech(this.sentences[this.currentIndex]);
       return;
     }
 
-    // 首次失败，尝试跳到当前句重新朗读
+    // 首次失败，500ms 后重新尝试合成并播放当前句
     this.events.onError?.(error);
-    setTimeout(() => {
-      if (this.state === 'loading' || this.state === 'playing') {
-        this.playCurrentSentence();
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      if (token === this.playToken && (this.state === 'loading' || this.state === 'playing')) {
+        void this.playCurrentSentence();
       }
     }, 500);
   }
@@ -490,7 +608,8 @@ export class NovelPlayer {
    */
   private playViaWebSpeech(text: string): void {
     this.setState('playing');
-    this.requestWakeLock();
+    this.isSpeechUnlocked = true;
+    void this.requestWakeLock();
 
     this.webSpeechEngine.speak(
       text,
@@ -524,7 +643,7 @@ export class NovelPlayer {
     if (this.currentIndex >= this.sentences.length) {
       this.handleChapterEnd();
     } else {
-      this.playCurrentSentence();
+      void this.playCurrentSentence();
     }
   }
 
@@ -541,6 +660,9 @@ export class NovelPlayer {
   pause(): void {
     if (this.state !== 'playing' && this.state !== 'loading') return;
 
+    this.clearRetryTimer();
+    this.playToken++;
+
     if (this.isUsingFallback) {
       this.webSpeechEngine.pause();
     } else if (this.audio && typeof this.audio.pause === 'function') {
@@ -554,28 +676,53 @@ export class NovelPlayer {
   resume(): void {
     if (this.state !== 'paused') return;
 
-    this.setState('playing');
-    this.requestWakeLock();
-
     if (this.isUsingFallback) {
-      this.webSpeechEngine.resume();
-    } else if (this.audio && typeof this.audio.play === 'function') {
+      if (typeof window !== 'undefined' && window.speechSynthesis?.paused) {
+        this.setState('playing');
+        void this.requestWakeLock();
+        this.webSpeechEngine.resume();
+      } else {
+        void this.playCurrentSentence();
+      }
+      return;
+    }
+
+    // 若是在 loading 阶段暂停或音频源仍为静音占位，重新载入当前句
+    if (!this.audio.src || this.audio.src === SILENT_AUDIO_WAV) {
+      void this.playCurrentSentence();
+      return;
+    }
+
+    this.setState('playing');
+    void this.requestWakeLock();
+
+    if (this.audio && typeof this.audio.play === 'function') {
+      this.audio.playbackRate = 1.0;
       const playPromise = this.audio.play();
       if (playPromise && typeof playPromise.then === 'function') {
-        playPromise.catch((err: any) => {
-          if (err.name === 'NotAllowedError') {
-            this.setState('paused');
-            this.events.onToast?.('请再点一次播放解锁声音');
-            return;
-          }
-          // 若原音频恢复失败，重新载入当前句
-          this.playCurrentSentence();
-        });
+        playPromise
+          .then(() => {
+            this.isAudioUnlocked = true;
+          })
+          .catch((err: any) => {
+            if (err?.name === 'NotAllowedError') {
+              this.isAudioUnlocked = false;
+              this.releaseWakeLock();
+              this.setState('paused');
+              this.events.onToast?.('请再点一次播放解锁声音');
+              return;
+            }
+            // 若原音频恢复失败，重新载入当前句
+            void this.playCurrentSentence();
+          });
       }
     }
   }
 
   stop(): void {
+    this.clearRetryTimer();
+    this.playToken++;
+
     if (this.isUsingFallback) {
       this.webSpeechEngine.cancel();
     } else if (this.audio) {
@@ -594,11 +741,12 @@ export class NovelPlayer {
 
   nextSentence(): void {
     if (this.sentences.length === 0) return;
-    this.unlockAllAudio();
+    this.clearRetryTimer();
+    this.unlockAllAudio({ audio: !this.isUsingFallback, speech: false });
     if (this.currentIndex < this.sentences.length - 1) {
       this.revokeCacheItem(this.currentIndex);
       this.currentIndex++;
-      this.playCurrentSentence();
+      void this.playCurrentSentence();
     } else {
       this.handleChapterEnd();
     }
@@ -606,44 +754,50 @@ export class NovelPlayer {
 
   previousSentence(): void {
     if (this.sentences.length === 0) return;
-    this.unlockAllAudio();
+    this.clearRetryTimer();
+    this.unlockAllAudio({ audio: !this.isUsingFallback, speech: false });
     if (this.currentIndex > 0) {
       this.revokeCacheItem(this.currentIndex);
       this.currentIndex--;
-      this.playCurrentSentence();
-    } else {
-      this.playCurrentSentence();
     }
+    void this.playCurrentSentence();
   }
 
   seek(index: number): void {
     if (this.sentences.length === 0) return;
-    this.unlockAllAudio();
+    this.clearRetryTimer();
+    this.unlockAllAudio({ audio: !this.isUsingFallback, speech: false });
     const target = Math.max(0, Math.min(index, this.sentences.length - 1));
     this.clearPrefetchCache();
     this.currentIndex = target;
-    this.playCurrentSentence();
+    void this.playCurrentSentence();
   }
 
   setRate(rate: number): void {
     this.rate = rate;
-    // 语速变更后清空未来句的预取缓存，以新语速预取
-    this.clearPrefetchCache();
     if (this.state === 'playing') {
       if (this.isUsingFallback) {
-        this.playCurrentSentence();
+        this.clearPrefetchCache();
+        void this.playCurrentSentence();
       } else {
-        this.audio.playbackRate = rate;
+        // Edge Worker 已通过 SSML 合成目标语速，严禁叠加修改 audio.playbackRate；
+        // 仅清理未来预取缓存，保留当前正在播放的句
+        this.clearFuturePrefetchCache();
         this.triggerPrefetch();
       }
+    } else if (this.state === 'loading') {
+      this.clearPrefetchCache();
+      void this.playCurrentSentence();
+    } else {
+      this.clearPrefetchCache();
     }
   }
 
   setVoice(voice: string): void {
     this.voice = voice;
     this.clearPrefetchCache();
-    if (this.state === 'playing') {
-      this.playCurrentSentence();
+    if (this.state === 'playing' || this.state === 'loading') {
+      void this.playCurrentSentence();
     }
   }
 }

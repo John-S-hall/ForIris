@@ -21,15 +21,11 @@ export class FloatingBar {
   private events: FloatingBarEvents;
 
   // 状态引用
-  private isExpanded = false;
   private isSettingsOpen = false;
   private playerState: PlayerState = 'idle';
-  private currentProgress = { index: 0, total: 0, text: '' };
-  private currentChapterTitle = '小说听书';
   private currentChapterUrl: string | null = null;
-  private currentRate = 1.2;
-  private currentVoice = 'zh-CN-XiaoxiaoNeural';
-  private ballPosition: BallPosition = { side: 'right', offsetTop: 0 };
+  private currentRate = 1.0;
+  private ballPosition: BallPosition | null = null;
 
   // DOM 元素引用
   private ballEl!: HTMLElement;
@@ -48,24 +44,41 @@ export class FloatingBar {
   private testResultEl!: HTMLElement;
   private jumpChapterBtn!: HTMLElement;
 
-  private toastTimer: any = null;
+  private toastTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // 需清理的全局监听器引用
+  private onWindowTouchMove: ((e: TouchEvent) => void) | null = null;
+  private onWindowTouchEnd: (() => void) | null = null;
+  private onWindowMouseMove: ((e: MouseEvent) => void) | null = null;
+  private onWindowMouseUp: (() => void) | null = null;
+  private onWindowResize: (() => void) | null = null;
 
   constructor(config: AppConfig, events: FloatingBarEvents) {
     this.events = events;
     this.currentRate = config.rate;
-    this.currentVoice = config.voice;
-    if (config.ballPosition) {
-      this.ballPosition = config.ballPosition;
-    }
+    this.ballPosition = config.ballPosition ?? null;
 
-    this.host = document.createElement('div');
+    this.host = document.createElement('novel-tts-host');
     this.host.id = 'novel-tts-floating-root';
+    this.applyHostStyles();
     this.shadow = this.host.attachShadow({ mode: 'open' });
 
     this.render(config);
     this.applyBallPosition();
     this.bindEvents();
     this.bindDragEvents();
+  }
+
+  private applyHostStyles(): void {
+    this.host.style.setProperty('position', 'fixed', 'important');
+    this.host.style.setProperty('inset', '0', 'important');
+    this.host.style.setProperty('z-index', '2147483647', 'important');
+    this.host.style.setProperty('pointer-events', 'none', 'important');
+    this.host.style.setProperty('display', 'block', 'important');
+    this.host.style.setProperty('margin', '0', 'important');
+    this.host.style.setProperty('padding', '0', 'important');
+    this.host.style.setProperty('border', '0', 'important');
+    this.host.style.setProperty('background', 'transparent', 'important');
   }
 
   mount(parent?: HTMLElement): void {
@@ -76,6 +89,30 @@ export class FloatingBar {
   }
 
   unmount(): void {
+    if (this.toastTimer !== null) {
+      clearTimeout(this.toastTimer);
+      this.toastTimer = null;
+    }
+    if (this.onWindowTouchMove) {
+      window.removeEventListener('touchmove', this.onWindowTouchMove);
+      this.onWindowTouchMove = null;
+    }
+    if (this.onWindowTouchEnd) {
+      window.removeEventListener('touchend', this.onWindowTouchEnd);
+      this.onWindowTouchEnd = null;
+    }
+    if (this.onWindowMouseMove) {
+      window.removeEventListener('mousemove', this.onWindowMouseMove);
+      this.onWindowMouseMove = null;
+    }
+    if (this.onWindowMouseUp) {
+      window.removeEventListener('mouseup', this.onWindowMouseUp);
+      this.onWindowMouseUp = null;
+    }
+    if (this.onWindowResize) {
+      window.removeEventListener('resize', this.onWindowResize);
+      this.onWindowResize = null;
+    }
     if (this.host.parentNode) {
       this.host.parentNode.removeChild(this.host);
     }
@@ -83,9 +120,9 @@ export class FloatingBar {
 
   toggleVisible(): void {
     if (this.host.style.display === 'none') {
-      this.host.style.display = 'block';
+      this.host.style.setProperty('display', 'block', 'important');
     } else {
-      this.host.style.display = 'none';
+      this.host.style.setProperty('display', 'none', 'important');
     }
   }
 
@@ -98,13 +135,11 @@ export class FloatingBar {
   }
 
   updateProgress(index: number, total: number, sentence: string): void {
-    this.currentProgress = { index, total, text: sentence };
     this.progressEl.textContent = `${index + 1} / ${total}`;
     this.textEl.textContent = sentence || '正在准备朗读…';
   }
 
-  updateChapter(title: string, nextUrl: string | null, currentUrl?: string): void {
-    this.currentChapterTitle = title;
+  updateChapter(title: string, currentUrl?: string): void {
     this.titleEl.textContent = title;
     if (currentUrl) {
       this.currentChapterUrl = currentUrl;
@@ -114,14 +149,20 @@ export class FloatingBar {
     }
   }
 
+  syncConfigInputs(workerUrl: string, token: string): void {
+    this.workerInput.value = workerUrl;
+    this.tokenInput.value = token;
+  }
+
   showToast(message: string, duration = 3000): void {
-    if (this.toastTimer) {
+    if (this.toastTimer !== null) {
       clearTimeout(this.toastTimer);
     }
     this.toastEl.textContent = message;
     this.toastEl.classList.add('visible');
     this.toastTimer = setTimeout(() => {
       this.toastEl.classList.remove('visible');
+      this.toastTimer = null;
     }, duration);
   }
 
@@ -137,8 +178,6 @@ export class FloatingBar {
         line-height: 1.4;
         color: #f1f5f9;
         -webkit-tap-highlight-color: transparent;
-        z-index: 2147483647 !important;
-        position: relative;
       }
 
       /* 悬浮小球 (折叠态) */
@@ -159,6 +198,7 @@ export class FloatingBar {
         cursor: grab;
         user-select: none;
         touch-action: none;
+        pointer-events: auto;
         transition: box-shadow 0.2s, background 0.2s;
         z-index: 2147483647;
       }
@@ -194,6 +234,7 @@ export class FloatingBar {
         box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.45);
         padding: 14px 16px env(safe-area-inset-bottom, 14px);
         box-sizing: border-box;
+        pointer-events: auto;
         transform: translateY(105%);
         transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1);
         z-index: 2147483647;
@@ -260,22 +301,25 @@ export class FloatingBar {
         color: #94a3b8;
       }
 
-      /* 当前朗读句预览 (严格2行高度，不露第3行半截) */
+      /* 当前朗读句预览 (外层负责 padding，内层精准 2 行截断防露出第 3 行半截) */
+      .sentence-preview-wrap {
+        background: rgba(255, 255, 255, 0.04);
+        padding: 6px 10px;
+        border-radius: 6px;
+        margin-bottom: 12px;
+      }
       .sentence-preview {
+        padding: 0;
+        margin: 0;
         font-size: 13px;
         line-height: 1.5;
-        height: 39px;
+        min-height: 39px;
         max-height: 39px;
-        margin-bottom: 12px;
         overflow: hidden;
         text-overflow: ellipsis;
         display: -webkit-box;
         -webkit-line-clamp: 2;
         -webkit-box-orient: vertical;
-        background: rgba(255, 255, 255, 0.04);
-        padding: 6px 10px;
-        border-radius: 6px;
-        box-sizing: content-box;
       }
 
       /* 控制按钮主行 */
@@ -483,7 +527,9 @@ export class FloatingBar {
           </div>
         </div>
 
-        <div class="sentence-preview" id="tts-sentence">点击播放开始听书…</div>
+        <div class="sentence-preview-wrap">
+          <div class="sentence-preview" id="tts-sentence">点击播放开始听书…</div>
+        </div>
 
         <!-- 主控区 -->
         <div class="controls">
@@ -518,11 +564,11 @@ export class FloatingBar {
         <div class="settings-drawer" id="tts-drawer">
           <div class="field">
             <label>Edge TTS Worker 地址 (URL)</label>
-            <input type="text" id="tts-worker-url" placeholder="http://localhost:8787 或 CF Worker 域名" value="${config.workerUrl}"/>
+            <input type="text" id="tts-worker-url" placeholder="https://xxx.workers.dev 或 http://localhost:8787" />
           </div>
           <div class="field">
-            <label>Worker 鉴权密钥 (Token)</label>
-            <input type="text" id="tts-token" placeholder="dev-secret" value="${config.token}"/>
+            <label>Worker 鉴权密钥 (Token，默认 dev-secret)</label>
+            <input type="text" id="tts-token" placeholder="dev-secret" />
           </div>
           <div style="display: flex; gap: 8px; margin-top: 6px;">
             <button class="save-btn" id="tts-save-config" style="flex: 1;">保存配置</button>
@@ -556,16 +602,24 @@ export class FloatingBar {
     this.testResultEl = this.shadow.querySelector('#tts-test-result')!;
     this.jumpChapterBtn = this.shadow.querySelector('#tts-jump')!;
 
+    // 通过 DOM 属性安全赋值，防止 XSS/属性注入，并使默认 Token 清晰可见
+    this.workerInput.value = config.workerUrl;
+    this.tokenInput.value = config.token;
     this.voiceSelect.value = config.voice;
   }
 
+  private clampOffsetTop(offsetTop: number): number {
+    const maxTop = Math.max(60, window.innerHeight - 80);
+    return Math.max(60, Math.min(maxTop, offsetTop));
+  }
+
   private applyBallPosition(): void {
-    if (!this.ballPosition || !this.ballPosition.offsetTop) {
-      // 保持默认 CSS 初始位置
+    if (!this.ballPosition) {
       return;
     }
     const { side, offsetTop } = this.ballPosition;
-    this.ballEl.style.top = `${offsetTop}px`;
+    const clampedTop = this.clampOffsetTop(offsetTop);
+    this.ballEl.style.top = `${clampedTop}px`;
     this.ballEl.style.bottom = 'auto';
     if (side === 'left') {
       this.ballEl.style.left = '12px';
@@ -612,8 +666,8 @@ export class FloatingBar {
         let currentTop = initialTop + dy;
 
         // 视口边界约束
-        const maxX = window.innerWidth - 46;
-        const maxY = window.innerHeight - 46;
+        const maxX = Math.max(0, window.innerWidth - 46);
+        const maxY = Math.max(40, window.innerHeight - 46);
         currentLeft = Math.max(0, Math.min(maxX, currentLeft));
         currentTop = Math.max(40, Math.min(maxY - 40, currentTop));
 
@@ -627,12 +681,12 @@ export class FloatingBar {
     const onEnd = () => {
       if (!isDragging) return;
       isDragging = false;
-      this.ballEl.style.transition = 'left 0.25s cubic-bezier(0.16, 1, 0.3, 1), right 0.25s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.2s';
+      this.ballEl.style.transition =
+        'left 0.25s cubic-bezier(0.16, 1, 0.3, 1), right 0.25s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.2s';
 
       if (hasMoved) {
         const rect = this.ballEl.getBoundingClientRect();
         const screenWidth = window.innerWidth;
-        const screenHeight = window.innerHeight;
         const ballCenterX = rect.left + rect.width / 2;
 
         // 自动吸附到最近边缘 (左或右)
@@ -648,7 +702,7 @@ export class FloatingBar {
         }
 
         // 限制垂直高度安全区间
-        const offsetTop = Math.max(60, Math.min(screenHeight - 80, rect.top));
+        const offsetTop = this.clampOffsetTop(rect.top);
         this.ballEl.style.top = `${offsetTop}px`;
         this.ballEl.style.bottom = 'auto';
 
@@ -658,21 +712,26 @@ export class FloatingBar {
     };
 
     // 移动端 Touch
-    this.ballEl.addEventListener('touchstart', (e) => {
-      if (e.touches.length === 1) {
-        onStart(e.touches[0].clientX, e.touches[0].clientY);
-      }
-    }, { passive: true });
+    this.ballEl.addEventListener(
+      'touchstart',
+      (e) => {
+        if (e.touches.length === 1) {
+          onStart(e.touches[0].clientX, e.touches[0].clientY);
+        }
+      },
+      { passive: true }
+    );
 
-    window.addEventListener('touchmove', (e) => {
+    this.onWindowTouchMove = (e: TouchEvent) => {
       if (isDragging && e.touches.length === 1) {
         onMove(e.touches[0].clientX, e.touches[0].clientY);
       }
-    }, { passive: true });
-
-    window.addEventListener('touchend', () => {
+    };
+    this.onWindowTouchEnd = () => {
       onEnd();
-    });
+    };
+    window.addEventListener('touchmove', this.onWindowTouchMove, { passive: true });
+    window.addEventListener('touchend', this.onWindowTouchEnd);
 
     // 鼠标 Mouse
     this.ballEl.addEventListener('mousedown', (e) => {
@@ -681,20 +740,28 @@ export class FloatingBar {
       }
     });
 
-    window.addEventListener('mousemove', (e) => {
+    this.onWindowMouseMove = (e: MouseEvent) => {
       if (isDragging) {
         onMove(e.clientX, e.clientY);
       }
-    });
-
-    window.addEventListener('mouseup', () => {
+    };
+    this.onWindowMouseUp = () => {
       onEnd();
-    });
+    };
+    window.addEventListener('mousemove', this.onWindowMouseMove);
+    window.addEventListener('mouseup', this.onWindowMouseUp);
+
+    // 横竖屏或窗口尺寸变化时重新约束悬浮球位置
+    this.onWindowResize = () => {
+      this.applyBallPosition();
+    };
+    window.addEventListener('resize', this.onWindowResize);
 
     // 点击小球（如果不是拖拽，则展开）
     this.ballEl.addEventListener('click', (e) => {
       if (hasMoved) {
         e.stopPropagation();
+        hasMoved = false;
         return;
       }
       this.expandPanel();
@@ -737,8 +804,7 @@ export class FloatingBar {
 
     // 切换音色
     this.voiceSelect.addEventListener('change', () => {
-      this.currentVoice = this.voiceSelect.value;
-      this.events.onVoiceChange(this.currentVoice);
+      this.events.onVoiceChange(this.voiceSelect.value);
       this.showToast('音色已更新');
     });
 
@@ -748,14 +814,13 @@ export class FloatingBar {
       this.settingsDrawer.classList.toggle('open', this.isSettingsOpen);
     });
 
-    // 保存 Worker 设置
+    // 保存 Worker 设置（提示统一交由 main.ts onSaveConfig 回调处理，避免重复 Toast）
     this.shadow.querySelector('#tts-save-config')!.addEventListener('click', () => {
       const url = this.workerInput.value.trim();
       const token = this.tokenInput.value.trim();
       this.events.onSaveConfig(url, token);
       this.isSettingsOpen = false;
       this.settingsDrawer.classList.remove('open');
-      this.showToast('配置已保存并生效');
     });
 
     // 测试 Worker 连接
@@ -805,13 +870,11 @@ export class FloatingBar {
   }
 
   private expandPanel(): void {
-    this.isExpanded = true;
     this.panelEl.classList.add('open');
     this.ballEl.style.display = 'none';
   }
 
   private collapsePanel(): void {
-    this.isExpanded = false;
     this.panelEl.classList.remove('open');
     this.ballEl.style.display = 'flex';
   }

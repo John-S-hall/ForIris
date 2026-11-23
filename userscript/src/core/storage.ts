@@ -13,9 +13,9 @@ export interface AppConfig {
 
 export const DEFAULT_CONFIG: AppConfig = {
   workerUrl: '',
-  token: '',
+  token: 'dev-secret',
   voice: 'zh-CN-XiaoxiaoNeural',
-  rate: 1.2,
+  rate: 1.0,
 };
 
 const STORAGE_KEY = 'novel_tts_config';
@@ -29,19 +29,36 @@ export class ConfigStorage {
     return typeof GM_getValue === 'function' && typeof GM_setValue === 'function';
   }
 
+  private static normalizeConfig(parsed: Partial<AppConfig>): AppConfig {
+    const merged: AppConfig = { ...DEFAULT_CONFIG, ...parsed };
+    if (typeof merged.token !== 'string' || merged.token.trim().length === 0) {
+      merged.token = DEFAULT_CONFIG.token;
+    }
+    if (typeof merged.rate !== 'number' || !Number.isFinite(merged.rate) || merged.rate <= 0) {
+      merged.rate = DEFAULT_CONFIG.rate;
+    }
+    if (typeof merged.voice !== 'string' || merged.voice.trim().length === 0) {
+      merged.voice = DEFAULT_CONFIG.voice;
+    }
+    if (typeof merged.workerUrl !== 'string') {
+      merged.workerUrl = DEFAULT_CONFIG.workerUrl;
+    }
+    return merged;
+  }
+
   static load(): AppConfig {
     try {
       if (this.isGMSupported()) {
         const raw = GM_getValue<string | null>(STORAGE_KEY, null);
         if (raw) {
           const parsed = JSON.parse(raw);
-          return { ...DEFAULT_CONFIG, ...parsed };
+          return this.normalizeConfig(parsed);
         }
       } else if (typeof localStorage !== 'undefined') {
         const raw = localStorage.getItem(STORAGE_KEY);
         if (raw) {
           const parsed = JSON.parse(raw);
-          return { ...DEFAULT_CONFIG, ...parsed };
+          return this.normalizeConfig(parsed);
         }
       }
     } catch {
@@ -52,7 +69,7 @@ export class ConfigStorage {
 
   static save(patch: Partial<AppConfig>): AppConfig {
     const current = this.load();
-    const updated: AppConfig = { ...current, ...patch };
+    const updated = this.normalizeConfig({ ...current, ...patch });
 
     try {
       const serialized = JSON.stringify(updated);

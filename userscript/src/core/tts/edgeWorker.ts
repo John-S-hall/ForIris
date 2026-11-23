@@ -14,6 +14,16 @@ export interface ConnectionTestResult {
   error?: string;
 }
 
+export class WorkerHttpError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'WorkerHttpError';
+    this.status = status;
+  }
+}
+
 export class EdgeWorkerTTSProvider implements TTSProvider {
   readonly name = 'edge-worker';
 
@@ -24,7 +34,7 @@ export class EdgeWorkerTTSProvider implements TTSProvider {
 
   constructor(options: EdgeWorkerOptions) {
     this.workerUrl = this.sanitizeUrl(options.workerUrl);
-    this.token = options.token;
+    this.token = this.sanitizeToken(options.token);
     this.timeoutMs = options.timeoutMs ?? 8000;
   }
 
@@ -32,12 +42,17 @@ export class EdgeWorkerTTSProvider implements TTSProvider {
     return url.trim().replace(/\/+$/, '').replace(/\/tts\/?$/i, '');
   }
 
+  private sanitizeToken(token?: string): string {
+    const trimmed = (token ?? '').trim();
+    return trimmed || 'dev-secret';
+  }
+
   updateConfig(workerUrl?: string, token?: string): void {
     if (workerUrl !== undefined) {
       this.workerUrl = this.sanitizeUrl(workerUrl);
     }
     if (token !== undefined) {
-      this.token = token;
+      this.token = this.sanitizeToken(token);
     }
   }
 
@@ -46,17 +61,31 @@ export class EdgeWorkerTTSProvider implements TTSProvider {
   }
 
   private buildUrl(text: string, options: TTSOptions, customUrl?: string, customToken?: string): string {
-    const baseUrl = customUrl ? this.sanitizeUrl(customUrl) : this.workerUrl;
-    const token = customToken !== undefined ? customToken : this.token;
+    const baseUrl = customUrl !== undefined ? this.sanitizeUrl(customUrl) : this.workerUrl;
+    if (!baseUrl) {
+      throw new Error('Worker 地址不能为空');
+    }
+    const token =
+      customToken !== undefined ? this.sanitizeToken(customToken) : this.sanitizeToken(this.token);
 
     const queryParams = new URLSearchParams({
       text: text.trim(),
       voice: options.voice || 'zh-CN-XiaoxiaoNeural',
-      rate: String(options.rate || 1.2),
+      rate: String(options.rate || 1.0),
       token,
     });
 
     return `${baseUrl}/tts?${queryParams.toString()}`;
+  }
+
+  private createHttpError(status: number, statusText?: string): WorkerHttpError {
+    if (status === 401) {
+      return new WorkerHttpError(401, 'HTTP 401 密钥错误: 当前 Token 与 Worker 环境变量 AUTH_TOKEN 不一致');
+    }
+    if (status === 502) {
+      return new WorkerHttpError(502, 'HTTP 502 上游异常: Edge TTS 微软服务端合成失败');
+    }
+    return new WorkerHttpError(status, `Edge Worker HTTP ${status}: ${statusText || '请求失败'}`);
   }
 
   /**
@@ -89,34 +118,67 @@ export class EdgeWorkerTTSProvider implements TTSProvider {
   }
 
   /**
-   * 主通道：通过 window.fetch 获取音频
+   * 主通道：通过 window.fetch 获取音频（含超时与外部 AbortSignal 联动）
    */
   private async synthesizeViaFetch(targetUrl: string, signal?: AbortSignal): Promise<ArrayBuffer> {
-    // 纯 GET 简单请求，不附加任何自定义 header，避免触发 CORS OPTIONS 预检
-    const res = await window.fetch(targetUrl, {
-      method: 'GET',
-      mode: 'cors',
-      signal,
-    });
-
-    if (!res.ok) {
-      if (res.status === 401) {
-        throw new Error('HTTP 401 密钥错误: 请检查 Worker Token 配置');
-      }
-      if (res.status === 502) {
-        throw new Error('HTTP 502 上游异常: Edge TTS 微软服务端合成失败');
-      }
-      throw new Error(`Edge Worker HTTP ${res.status}: ${res.statusText || '请求失败'}`);
+    if (signal?.aborted) {
+      throw new DOMException('The synthesis request was aborted', 'AbortError');
     }
 
-    const buf = await res.arrayBuffer();
-    return this.normalizeAudioBuffer(buf);
+    const timeoutController = new AbortController();
+    let timedOut = false;
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      timeoutController.abort();
+    }, this.timeoutMs);
+
+    const onExternalAbort = () => {
+      timeoutController.abort();
+    };
+
+    if (signal) {
+      signal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+
+    try {
+      // 纯 GET 简单请求，不附加任何自定义 header，避免触发 CORS OPTIONS 预检
+      const res = await window.fetch(targetUrl, {
+        method: 'GET',
+        mode: 'cors',
+        signal: timeoutController.signal,
+      });
+
+      if (!res.ok) {
+        throw this.createHttpError(res.status, res.statusText);
+      }
+
+      const buf = await res.arrayBuffer();
+      return await this.normalizeAudioBuffer(buf);
+    } catch (err: any) {
+      if (timedOut) {
+        throw new Error(`Edge Worker 请求超时 (${this.timeoutMs}ms)`);
+      }
+      if (signal?.aborted) {
+        throw new DOMException('The synthesis request was aborted', 'AbortError');
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      if (signal) {
+        signal.removeEventListener('abort', onExternalAbort);
+      }
+    }
   }
 
   /**
    * 兜底通道：通过 GM_xmlhttpRequest 获取音频（带 8500ms JS 超时保险丝）
    */
   private async synthesizeViaGM(targetUrl: string, signal?: AbortSignal): Promise<ArrayBuffer> {
+    if (signal?.aborted) {
+      throw new DOMException('The synthesis request was aborted', 'AbortError');
+    }
+
     const gmRequest = typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null;
     if (!gmRequest) {
       throw new Error('GM_xmlhttpRequest 在当前环境中不可用');
@@ -140,7 +202,7 @@ export class EdgeWorkerTTSProvider implements TTSProvider {
       };
 
       let requestHandle: { abort?: () => void } | null = null;
-      let hardTimeoutTimer: any = null;
+      let hardTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
 
       const cleanup = () => {
         if (hardTimeoutTimer) {
@@ -187,19 +249,7 @@ export class EdgeWorkerTTSProvider implements TTSProvider {
           timeout: this.timeoutMs,
           onload: async (response) => {
             if (response.status < 200 || response.status >= 300) {
-              if (response.status === 401) {
-                finishError(new Error('HTTP 401 密钥错误: 请检查 Worker Token 配置'));
-                return;
-              }
-              if (response.status === 502) {
-                finishError(new Error('HTTP 502 上游异常: Edge TTS 微软服务端合成失败'));
-                return;
-              }
-              finishError(
-                new Error(
-                  `Edge Worker HTTP ${response.status}: ${response.statusText || '请求失败'}`
-                )
-              );
+              finishError(this.createHttpError(response.status, response.statusText));
               return;
             }
 
@@ -241,12 +291,12 @@ export class EdgeWorkerTTSProvider implements TTSProvider {
       audioBuffer = await this.synthesizeViaFetch(targetUrl, options.signal);
       sourceUsed = 'fetch';
     } catch (fetchErr: any) {
-      if (fetchErr.name === 'AbortError') {
+      if (fetchErr?.name === 'AbortError') {
         throw fetchErr;
       }
 
-      // 如果是明确的 HTTP 业务错误（如 401 密钥错误、502 上游错误），不属于 CSP/网络阻断，直接报错
-      if (fetchErr.message && fetchErr.message.startsWith('HTTP ')) {
+      // 业务状态码错误（如 401/403/404/500/502），不属于 CSP/网络阻断，直接报错不回退
+      if (fetchErr instanceof WorkerHttpError) {
         throw fetchErr;
       }
 
@@ -256,6 +306,9 @@ export class EdgeWorkerTTSProvider implements TTSProvider {
           audioBuffer = await this.synthesizeViaGM(targetUrl, options.signal);
           sourceUsed = 'GM_xhr';
         } catch (gmErr: any) {
+          if (gmErr?.name === 'AbortError') {
+            throw gmErr;
+          }
           throw new Error(`双通道请求均失败 (fetch: ${fetchErr.message}; GM: ${gmErr.message})`);
         }
       } else {
@@ -279,9 +332,8 @@ export class EdgeWorkerTTSProvider implements TTSProvider {
       rate: 1.0,
     };
 
-    const targetUrl = this.buildUrl(testText, testOptions, customUrl, customToken);
-
     try {
+      const targetUrl = this.buildUrl(testText, testOptions, customUrl, customToken);
       let buffer: ArrayBuffer;
       let source: 'fetch' | 'GM_xhr' = 'fetch';
 
@@ -289,7 +341,7 @@ export class EdgeWorkerTTSProvider implements TTSProvider {
         buffer = await this.synthesizeViaFetch(targetUrl);
         source = 'fetch';
       } catch (fetchErr: any) {
-        if (fetchErr.message && fetchErr.message.startsWith('HTTP ')) {
+        if (fetchErr instanceof WorkerHttpError) {
           throw fetchErr;
         }
         if (typeof GM_xmlhttpRequest === 'function') {

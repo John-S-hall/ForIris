@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelTTS-Userscript
 // @namespace    https://github.com/John-S-hall/ForIris
-// @version      0.2.0
+// @version      0.2.1
 // @author       John-S-hall
 // @description  移动端网页小说听书油猴脚本
 // @match        *://*/*
@@ -1853,7 +1853,11 @@
     "#chapter-content",
     ".chapter-content"
   ];
-  const NEXT_CHAPTER_REGEX = /^(?:下一[章页]|下页|下一话)$|下一章|下一页|下页/;
+  const NEXT_CHAPTER_EXCLUDE_REGEX = /(?:上一|目录|书架|书签|推荐|预告|催更|评论|投票)/;
+  const NEXT_CHAPTER_TIER1_REGEX = /^(?:下一[章节回话]|下章|后一章|nextchapter)[→>»›]*$/i;
+  const NEXT_CHAPTER_TIER2_REGEX = /^(?:下一页|下页|nextpage|next)[→>»›]*$/i;
+  const NEXT_CHAPTER_TIER3_REGEX = /(?:下一章|下一页|下页|下一节|下章)/;
+  const INVALID_HREF_PROTOCOL_REGEX = /^(?:javascript|mailto|tel):/i;
   const NOISE_TAGS = /* @__PURE__ */ new Set([
     "SCRIPT",
     "STYLE",
@@ -1898,6 +1902,30 @@
     const text = clone.textContent || "";
     return cleanParagraphs(text);
   }
+  function measureTextStats(el) {
+    let nonLinkChars = 0;
+    let linkChars = 0;
+    const walk = (node, inLink) => {
+      if (node.nodeType === 3) {
+        const len = (node.nodeValue || "").replace(/\s+/g, "").length;
+        if (inLink) {
+          linkChars += len;
+        } else {
+          nonLinkChars += len;
+        }
+        return;
+      }
+      if (node.nodeType !== 1) return;
+      const elem = node;
+      if (NOISE_TAGS.has(elem.tagName)) return;
+      const nextInLink = inLink || elem.tagName === "A";
+      for (let i = 0; i < elem.childNodes.length; i++) {
+        walk(elem.childNodes[i], nextInLink);
+      }
+    };
+    walk(el, el.tagName === "A");
+    return { nonLinkChars, linkChars };
+  }
   function findFallbackContentElement(doc) {
     var _a;
     for (const selector of NOVEL_CONTENT_SELECTORS) {
@@ -1909,28 +1937,39 @@
         }
       }
     }
-    const candidates = doc.querySelectorAll("article, section, div");
+    const candidates = Array.from(doc.querySelectorAll("article, section, div"));
     let bestElement = null;
-    let maxTextLength = 0;
-    candidates.forEach((cand) => {
-      var _a2;
-      if (NOISE_TAGS.has(cand.tagName)) return;
+    let maxNonLinkLength = 0;
+    for (const cand of candidates) {
+      if (NOISE_TAGS.has(cand.tagName)) continue;
       if (cand.querySelector("form, input, button") && !cand.querySelector("p, br")) {
-        return;
+        continue;
       }
-      const directTextLength = ((_a2 = cand.textContent) == null ? void 0 : _a2.replace(/\s+/g, "").length) || 0;
-      if (directTextLength > maxTextLength) {
-        const innerBlocks = cand.querySelectorAll("article, section");
-        if (innerBlocks.length === 0) {
-          maxTextLength = directTextLength;
-          bestElement = cand;
-        }
+      const stats = measureTextStats(cand);
+      const totalChars = stats.nonLinkChars + stats.linkChars;
+      if (totalChars === 0 || stats.nonLinkChars < MIN_CONTENT_CHAR_THRESHOLD) {
+        continue;
       }
-    });
-    if (maxTextLength >= MIN_CONTENT_CHAR_THRESHOLD) {
-      return bestElement;
+      if (stats.linkChars / totalChars > 0.45) {
+        continue;
+      }
+      const innerBlocks = Array.from(cand.querySelectorAll("div, article, section"));
+      const hasTighterInnerBlock = innerBlocks.some((child) => {
+        if (NOISE_TAGS.has(child.tagName)) return false;
+        const childStats = measureTextStats(child);
+        const childTotal = childStats.nonLinkChars + childStats.linkChars;
+        if (childTotal === 0 || childStats.linkChars / childTotal > 0.45) return false;
+        return childStats.nonLinkChars >= stats.nonLinkChars * 0.8;
+      });
+      if (hasTighterInnerBlock) {
+        continue;
+      }
+      if (stats.nonLinkChars > maxNonLinkLength) {
+        maxNonLinkLength = stats.nonLinkChars;
+        bestElement = cand;
+      }
     }
-    return null;
+    return maxNonLinkLength >= MIN_CONTENT_CHAR_THRESHOLD ? bestElement : null;
   }
   function extractFallbackTitle(doc) {
     var _a, _b;
@@ -1947,32 +1986,9 @@
     }
     return "";
   }
-  function extractNextChapterUrl(doc, currentUrl) {
-    const baseUrl = currentUrl || doc.baseURI || "http://localhost";
-    let currentParsed = null;
+  function resolveValidNextUrl(rawHref, resolveBaseUrl, currentParsed) {
     try {
-      currentParsed = new URL(baseUrl);
-    } catch {
-    }
-    const links = Array.from(doc.querySelectorAll("a"));
-    let matchedHref = null;
-    for (let i = links.length - 1; i >= 0; i--) {
-      const link = links[i];
-      const text = cleanLine(link.textContent || "");
-      const title = cleanLine(link.getAttribute("title") || "");
-      if ((NEXT_CHAPTER_REGEX.test(text) || NEXT_CHAPTER_REGEX.test(title)) && !text.includes("上一") && !title.includes("上一")) {
-        const rawHref = link.getAttribute("href");
-        if (rawHref && rawHref.trim() && !rawHref.startsWith("javascript:") && rawHref !== "#") {
-          matchedHref = rawHref.trim();
-          break;
-        }
-      }
-    }
-    if (!matchedHref) {
-      return null;
-    }
-    try {
-      const absolute = new URL(matchedHref, baseUrl);
+      const absolute = new URL(rawHref, resolveBaseUrl);
       if (!["http:", "https:"].includes(absolute.protocol)) {
         return null;
       }
@@ -1987,6 +2003,57 @@
     } catch {
       return null;
     }
+  }
+  function extractNextChapterUrl(doc, currentUrl) {
+    var _a, _b, _c, _d;
+    const pageUrl = currentUrl || doc.baseURI || "http://localhost";
+    let currentParsed = null;
+    try {
+      currentParsed = new URL(pageUrl);
+    } catch {
+    }
+    let resolveBaseUrl = pageUrl;
+    const baseElHref = (_b = (_a = doc.querySelector("base[href]")) == null ? void 0 : _a.getAttribute("href")) == null ? void 0 : _b.trim();
+    if (baseElHref) {
+      try {
+        resolveBaseUrl = new URL(baseElHref, pageUrl).href;
+      } catch {
+      }
+    }
+    const links = Array.from(doc.querySelectorAll("a"));
+    let bestScore = 0;
+    let bestUrl = null;
+    for (const link of links) {
+      const rawHref = ((_c = link.getAttribute("href")) == null ? void 0 : _c.trim()) || "";
+      if (!rawHref || rawHref === "#" || INVALID_HREF_PROTOCOL_REGEX.test(rawHref)) {
+        continue;
+      }
+      if (link.closest(".comment, #comments, .comments, .reply, .recommend")) {
+        continue;
+      }
+      const compactText = cleanLine(link.textContent || "").replace(/\s+/g, "");
+      const compactTitle = cleanLine(link.getAttribute("title") || "").replace(/\s+/g, "");
+      if (NEXT_CHAPTER_EXCLUDE_REGEX.test(compactText) || NEXT_CHAPTER_EXCLUDE_REGEX.test(compactTitle)) {
+        continue;
+      }
+      const isKnownNextSelector = ((_d = link.getAttribute("rel")) == null ? void 0 : _d.toLowerCase()) === "next" || link.matches("#pb_next, #next_url, #pt_next, #nextchapter, #linkNext, a.next-chapter");
+      let score = 0;
+      if (NEXT_CHAPTER_TIER1_REGEX.test(compactText) || isKnownNextSelector) {
+        score = 100;
+      } else if (NEXT_CHAPTER_TIER2_REGEX.test(compactText)) {
+        score = 70;
+      } else if (NEXT_CHAPTER_TIER3_REGEX.test(compactText) && compactText.length <= 16 || NEXT_CHAPTER_TIER3_REGEX.test(compactTitle) && compactTitle.length <= 16) {
+        score = 40;
+      }
+      if (score === 0) continue;
+      const resolvedUrl = resolveValidNextUrl(rawHref, resolveBaseUrl, currentParsed);
+      if (!resolvedUrl) continue;
+      if (score >= bestScore) {
+        bestScore = score;
+        bestUrl = resolvedUrl;
+      }
+    }
+    return bestUrl;
   }
   function extractChapterContent(doc, currentUrl) {
     const nextChapterUrl = extractNextChapterUrl(doc, currentUrl);
@@ -2053,7 +2120,7 @@
         }
         const utterance = new SpeechSynthesisUtterance(text);
         this.currentUtterance = utterance;
-        utterance.rate = Math.max(0.5, Math.min(2.5, options.rate || 1.2));
+        utterance.rate = Math.max(0.5, Math.min(2.5, options.rate || 1));
         utterance.lang = "zh-CN";
         utterance.onstart = () => {
           var _a2;
@@ -2206,9 +2273,13 @@
       __publicField(this, "provider");
       __publicField(this, "webSpeechEngine");
       __publicField(this, "isUsingFallback", false);
-      // 单例音频实例
+      // 单例音频实例与解锁状态
       __publicField(this, "audio");
       __publicField(this, "isAudioUnlocked", false);
+      __publicField(this, "isSpeechUnlocked", false);
+      // 异步竞态控制与重试定时器
+      __publicField(this, "playToken", 0);
+      __publicField(this, "retryTimer", null);
       // 章节与句子队列
       __publicField(this, "currentChapter", null);
       __publicField(this, "sentences", []);
@@ -2226,7 +2297,7 @@
       __publicField(this, "wakeLockSentinel", null);
       this.provider = config.provider;
       this.voice = config.voice || "zh-CN-XiaoxiaoNeural";
-      this.rate = config.rate || 1.2;
+      this.rate = config.rate ?? 1;
       this.events = config.events || {};
       this.webSpeechEngine = new WebSpeechEngine();
       this.audio = typeof Audio !== "undefined" ? new Audio() : {};
@@ -2250,10 +2321,21 @@
       this.events = { ...this.events, ...events };
     }
     setProvider(provider) {
+      const wasActive = this.state === "playing" || this.state === "loading";
+      const wasFallback = this.isUsingFallback;
       this.provider = provider;
       this.isUsingFallback = false;
       this.consecutiveFailures = 0;
+      this.clearRetryTimer();
       this.clearPrefetchCache();
+      if (wasActive) {
+        if (wasFallback) {
+          this.webSpeechEngine.cancel();
+        } else if (this.audio && typeof this.audio.pause === "function") {
+          this.audio.pause();
+        }
+        void this.playCurrentSentence();
+      }
     }
     switchToFallback(reason) {
       var _a, _b;
@@ -2270,46 +2352,63 @@
       (_b = (_a = this.events).onStateChange) == null ? void 0 : _b.call(_a, newState);
       this.updateMediaSessionState();
     }
+    clearRetryTimer() {
+      if (this.retryTimer !== null) {
+        clearTimeout(this.retryTimer);
+        this.retryTimer = null;
+      }
+    }
     // ─── 音频事件与同步解锁 ──────────────────────────────────────────────────
     setupAudioListeners() {
       if (!this.audio || typeof this.audio.addEventListener !== "function") return;
       this.audio.addEventListener("ended", () => {
+        if (this.state !== "playing" || !this.audio.src || this.audio.src === SILENT_AUDIO_WAV) {
+          return;
+        }
         this.handleSentenceEnd();
       });
       this.audio.addEventListener("error", () => {
-        if (this.state === "playing") {
-          this.handlePlaybackFailure(new Error("Audio playback error"));
+        if (this.state !== "playing" || !this.audio.src || this.audio.src === SILENT_AUDIO_WAV) {
+          return;
         }
+        void this.handlePlaybackFailure(new Error("Audio playback error"), this.playToken);
       });
     }
     /**
      * 同步解锁函数：必须在播放手势的第一行同步调用
-     * 一次性同步解锁：1) <audio> 实例；2) window.speechSynthesis
+     * 幂等解锁：1) <audio> 实例；2) window.speechSynthesis
      */
-    unlockAllAudio() {
-      if (this.audio && typeof this.audio.play === "function") {
+    unlockAllAudio(opts = {}) {
+      const unlockAudio = opts.audio ?? true;
+      const unlockSpeech = opts.speech ?? true;
+      if (unlockAudio && !this.isAudioUnlocked && this.audio && typeof this.audio.play === "function") {
         try {
           if (!this.audio.src || this.audio.src === "" || this.audio.src === SILENT_AUDIO_WAV) {
             this.audio.src = SILENT_AUDIO_WAV;
-          }
-          const playPromise = this.audio.play();
-          if (playPromise && typeof playPromise.then === "function") {
-            playPromise.then(() => {
-              this.isAudioUnlocked = true;
-            }).catch(() => {
-            });
-          } else {
             this.isAudioUnlocked = true;
+            const playPromise = this.audio.play();
+            if (playPromise && typeof playPromise.then === "function") {
+              playPromise.then(() => {
+                this.isAudioUnlocked = true;
+              }).catch((err) => {
+                if ((err == null ? void 0 : err.name) === "NotAllowedError") {
+                  this.isAudioUnlocked = false;
+                }
+              });
+            }
           }
         } catch {
+          this.isAudioUnlocked = false;
         }
       }
-      if (typeof window !== "undefined" && "speechSynthesis" in window && typeof SpeechSynthesisUtterance !== "undefined") {
+      if (unlockSpeech && !this.isSpeechUnlocked && typeof window !== "undefined" && "speechSynthesis" in window && typeof SpeechSynthesisUtterance !== "undefined") {
         try {
           const dummyUtterance = new SpeechSynthesisUtterance("");
           dummyUtterance.volume = 0;
           window.speechSynthesis.speak(dummyUtterance);
+          this.isSpeechUnlocked = true;
         } catch {
+          this.isSpeechUnlocked = false;
         }
       }
     }
@@ -2393,6 +2492,25 @@
       this.prefetchCache.clear();
     }
     /**
+     * 仅清理未来预取缓存（保留当前正在播放句的 Blob URL，防止中断）
+     */
+    clearFuturePrefetchCache() {
+      this.prefetchCache.forEach((item, key) => {
+        if (key === this.currentIndex) return;
+        try {
+          item.abortController.abort();
+        } catch {
+        }
+        if (item.blobUrl) {
+          try {
+            URL.revokeObjectURL(item.blobUrl);
+          } catch {
+          }
+        }
+        this.prefetchCache.delete(key);
+      });
+    }
+    /**
      * 释放单条已播放完毕或无用的缓存
      */
     revokeCacheItem(index) {
@@ -2418,10 +2536,12 @@
       const next1 = this.currentIndex + 1;
       const next2 = this.currentIndex + 2;
       if (next1 < this.sentences.length) {
-        this.fetchSentenceBlob(next1);
+        this.fetchSentenceBlob(next1).catch(() => {
+        });
       }
       if (next2 < this.sentences.length) {
-        this.fetchSentenceBlob(next2);
+        this.fetchSentenceBlob(next2).catch(() => {
+        });
       }
       this.prefetchCache.forEach((_, key) => {
         if (key < this.currentIndex || key > this.currentIndex + 2) {
@@ -2433,7 +2553,7 @@
      * 获取或并发请求指定句子的音频 Blob URL
      */
     async fetchSentenceBlob(index) {
-      if (index >= this.sentences.length) {
+      if (index < 0 || index >= this.sentences.length) {
         throw new Error(`Sentence index out of range: ${index}`);
       }
       const cached = this.prefetchCache.get(index);
@@ -2455,30 +2575,40 @@
         rate: this.rate,
         signal: abortController.signal
       };
+      const item = { abortController };
       const promise = (async () => {
-        let lastError = null;
-        for (let attempt = 0; attempt < 2; attempt++) {
-          if (abortController.signal.aborted) {
-            throw new DOMException("Aborted", "AbortError");
-          }
-          try {
-            const blobUrl = await this.provider.synthesize(text, options);
-            const item = this.prefetchCache.get(index);
-            if (item) {
-              item.blobUrl = blobUrl;
+        try {
+          let lastError = null;
+          for (let attempt = 0; attempt < 2; attempt++) {
+            if (abortController.signal.aborted) {
+              throw new DOMException("Aborted", "AbortError");
             }
-            return blobUrl;
-          } catch (err) {
-            if (err.name === "AbortError") throw err;
-            lastError = err instanceof Error ? err : new Error(String(err));
+            try {
+              const blobUrl = await this.provider.synthesize(text, options);
+              if (abortController.signal.aborted || this.prefetchCache.get(index) !== item) {
+                try {
+                  URL.revokeObjectURL(blobUrl);
+                } catch {
+                }
+                throw new DOMException("Aborted", "AbortError");
+              }
+              item.blobUrl = blobUrl;
+              return blobUrl;
+            } catch (err) {
+              if ((err == null ? void 0 : err.name) === "AbortError") throw err;
+              lastError = err instanceof Error ? err : new Error(String(err));
+            }
           }
+          throw lastError || new Error(`Failed to synthesize sentence ${index}`);
+        } catch (err) {
+          if (this.prefetchCache.get(index) === item) {
+            this.prefetchCache.delete(index);
+          }
+          throw err;
         }
-        throw lastError || new Error(`Failed to synthesize sentence ${index}`);
       })();
-      this.prefetchCache.set(index, {
-        abortController,
-        promise
-      });
+      item.promise = promise;
+      this.prefetchCache.set(index, item);
       return promise;
     }
     // ─── 核心播放逻辑 ─────────────────────────────────────────────────────
@@ -2487,8 +2617,13 @@
      */
     async playChapter(chapter, startIndex = 0) {
       var _a, _b;
-      this.unlockAllAudio();
-      this.stop();
+      this.clearRetryTimer();
+      this.playToken++;
+      if (this.state !== "idle") {
+        this.stop();
+      } else {
+        this.clearPrefetchCache();
+      }
       this.currentChapter = chapter;
       this.sentences = chunkText(chapter.paragraphs);
       if (this.sentences.length === 0) {
@@ -2504,6 +2639,8 @@
      */
     async playCurrentSentence() {
       var _a, _b, _c, _d;
+      this.clearRetryTimer();
+      const token = ++this.playToken;
       if (this.currentIndex >= this.sentences.length) {
         this.handleChapterEnd();
         return;
@@ -2522,16 +2659,25 @@
       }
       try {
         const blobUrl = await this.fetchSentenceBlob(this.currentIndex);
-        if (this.state !== "loading") {
+        if (token !== this.playToken || this.state !== "loading") {
           return;
         }
+        this.audio.playbackRate = 1;
         this.audio.src = blobUrl;
         const playPromise = this.audio.play();
         if (playPromise && typeof playPromise.then === "function") {
           try {
             await playPromise;
           } catch (playErr) {
-            if (playErr.name === "NotAllowedError") {
+            if (token !== this.playToken) {
+              try {
+                this.audio.pause();
+              } catch {
+              }
+              return;
+            }
+            if ((playErr == null ? void 0 : playErr.name) === "NotAllowedError") {
+              this.isAudioUnlocked = false;
               this.setState("paused");
               (_d = (_c = this.events).onToast) == null ? void 0 : _d.call(_c, "请再点一次播放解锁声音");
               return;
@@ -2539,32 +2685,45 @@
             throw playErr;
           }
         }
+        if (token !== this.playToken) {
+          try {
+            this.audio.pause();
+          } catch {
+          }
+          return;
+        }
+        this.isAudioUnlocked = true;
         this.setState("playing");
         this.consecutiveFailures = 0;
         await this.requestWakeLock();
+        if (token !== this.playToken || this.getState() !== "playing") {
+          return;
+        }
         this.triggerPrefetch();
       } catch (err) {
-        if (err.name === "AbortError") return;
-        await this.handlePlaybackFailure(err);
+        if (token !== this.playToken || (err == null ? void 0 : err.name) === "AbortError") return;
+        await this.handlePlaybackFailure(err instanceof Error ? err : new Error(String(err)), token);
       }
     }
     /**
      * 单句播放失败与自动降级处理
      */
-    async handlePlaybackFailure(error) {
+    async handlePlaybackFailure(error, token) {
       var _a, _b, _c, _d;
+      if (token !== this.playToken) return;
       this.consecutiveFailures++;
       if (this.consecutiveFailures >= 2) {
         this.isUsingFallback = true;
         this.clearPrefetchCache();
-        (_b = (_a = this.events).onToast) == null ? void 0 : _b.call(_a, "Edge TTS 连接异常，已自动切换为系统语音朗读");
+        (_b = (_a = this.events).onToast) == null ? void 0 : _b.call(_a, `Edge TTS 异常 (${error.message})，已自动切换为系统语音朗读`);
         this.playViaWebSpeech(this.sentences[this.currentIndex]);
         return;
       }
       (_d = (_c = this.events).onError) == null ? void 0 : _d.call(_c, error);
-      setTimeout(() => {
-        if (this.state === "loading" || this.state === "playing") {
-          this.playCurrentSentence();
+      this.retryTimer = setTimeout(() => {
+        this.retryTimer = null;
+        if (token === this.playToken && (this.state === "loading" || this.state === "playing")) {
+          void this.playCurrentSentence();
         }
       }, 500);
     }
@@ -2573,7 +2732,8 @@
      */
     playViaWebSpeech(text) {
       this.setState("playing");
-      this.requestWakeLock();
+      this.isSpeechUnlocked = true;
+      void this.requestWakeLock();
       this.webSpeechEngine.speak(
         text,
         { voice: this.voice, rate: this.rate },
@@ -2602,7 +2762,7 @@
       if (this.currentIndex >= this.sentences.length) {
         this.handleChapterEnd();
       } else {
-        this.playCurrentSentence();
+        void this.playCurrentSentence();
       }
     }
     /**
@@ -2616,6 +2776,8 @@
     // ─── 用户控制方法 ─────────────────────────────────────────────────────
     pause() {
       if (this.state !== "playing" && this.state !== "loading") return;
+      this.clearRetryTimer();
+      this.playToken++;
       if (this.isUsingFallback) {
         this.webSpeechEngine.pause();
       } else if (this.audio && typeof this.audio.pause === "function") {
@@ -2625,27 +2787,47 @@
       this.setState("paused");
     }
     resume() {
+      var _a;
       if (this.state !== "paused") return;
-      this.setState("playing");
-      this.requestWakeLock();
       if (this.isUsingFallback) {
-        this.webSpeechEngine.resume();
-      } else if (this.audio && typeof this.audio.play === "function") {
+        if (typeof window !== "undefined" && ((_a = window.speechSynthesis) == null ? void 0 : _a.paused)) {
+          this.setState("playing");
+          void this.requestWakeLock();
+          this.webSpeechEngine.resume();
+        } else {
+          void this.playCurrentSentence();
+        }
+        return;
+      }
+      if (!this.audio.src || this.audio.src === SILENT_AUDIO_WAV) {
+        void this.playCurrentSentence();
+        return;
+      }
+      this.setState("playing");
+      void this.requestWakeLock();
+      if (this.audio && typeof this.audio.play === "function") {
+        this.audio.playbackRate = 1;
         const playPromise = this.audio.play();
         if (playPromise && typeof playPromise.then === "function") {
-          playPromise.catch((err) => {
-            var _a, _b;
-            if (err.name === "NotAllowedError") {
+          playPromise.then(() => {
+            this.isAudioUnlocked = true;
+          }).catch((err) => {
+            var _a2, _b;
+            if ((err == null ? void 0 : err.name) === "NotAllowedError") {
+              this.isAudioUnlocked = false;
+              this.releaseWakeLock();
               this.setState("paused");
-              (_b = (_a = this.events).onToast) == null ? void 0 : _b.call(_a, "请再点一次播放解锁声音");
+              (_b = (_a2 = this.events).onToast) == null ? void 0 : _b.call(_a2, "请再点一次播放解锁声音");
               return;
             }
-            this.playCurrentSentence();
+            void this.playCurrentSentence();
           });
         }
       }
     }
     stop() {
+      this.clearRetryTimer();
+      this.playToken++;
       if (this.isUsingFallback) {
         this.webSpeechEngine.cancel();
       } else if (this.audio) {
@@ -2661,64 +2843,86 @@
     }
     nextSentence() {
       if (this.sentences.length === 0) return;
-      this.unlockAllAudio();
+      this.clearRetryTimer();
+      this.unlockAllAudio({ audio: !this.isUsingFallback, speech: false });
       if (this.currentIndex < this.sentences.length - 1) {
         this.revokeCacheItem(this.currentIndex);
         this.currentIndex++;
-        this.playCurrentSentence();
+        void this.playCurrentSentence();
       } else {
         this.handleChapterEnd();
       }
     }
     previousSentence() {
       if (this.sentences.length === 0) return;
-      this.unlockAllAudio();
+      this.clearRetryTimer();
+      this.unlockAllAudio({ audio: !this.isUsingFallback, speech: false });
       if (this.currentIndex > 0) {
         this.revokeCacheItem(this.currentIndex);
         this.currentIndex--;
-        this.playCurrentSentence();
-      } else {
-        this.playCurrentSentence();
       }
+      void this.playCurrentSentence();
     }
     seek(index) {
       if (this.sentences.length === 0) return;
-      this.unlockAllAudio();
+      this.clearRetryTimer();
+      this.unlockAllAudio({ audio: !this.isUsingFallback, speech: false });
       const target = Math.max(0, Math.min(index, this.sentences.length - 1));
       this.clearPrefetchCache();
       this.currentIndex = target;
-      this.playCurrentSentence();
+      void this.playCurrentSentence();
     }
     setRate(rate) {
       this.rate = rate;
-      this.clearPrefetchCache();
       if (this.state === "playing") {
         if (this.isUsingFallback) {
-          this.playCurrentSentence();
+          this.clearPrefetchCache();
+          void this.playCurrentSentence();
         } else {
-          this.audio.playbackRate = rate;
+          this.clearFuturePrefetchCache();
           this.triggerPrefetch();
         }
+      } else if (this.state === "loading") {
+        this.clearPrefetchCache();
+        void this.playCurrentSentence();
+      } else {
+        this.clearPrefetchCache();
       }
     }
     setVoice(voice) {
       this.voice = voice;
       this.clearPrefetchCache();
-      if (this.state === "playing") {
-        this.playCurrentSentence();
+      if (this.state === "playing" || this.state === "loading") {
+        void this.playCurrentSentence();
       }
     }
   }
   const DEFAULT_CONFIG = {
     workerUrl: "",
-    token: "",
+    token: "dev-secret",
     voice: "zh-CN-XiaoxiaoNeural",
-    rate: 1.2
+    rate: 1
   };
   const STORAGE_KEY = "novel_tts_config";
   class ConfigStorage {
     static isGMSupported() {
       return typeof GM_getValue === "function" && typeof GM_setValue === "function";
+    }
+    static normalizeConfig(parsed) {
+      const merged = { ...DEFAULT_CONFIG, ...parsed };
+      if (typeof merged.token !== "string" || merged.token.trim().length === 0) {
+        merged.token = DEFAULT_CONFIG.token;
+      }
+      if (typeof merged.rate !== "number" || !Number.isFinite(merged.rate) || merged.rate <= 0) {
+        merged.rate = DEFAULT_CONFIG.rate;
+      }
+      if (typeof merged.voice !== "string" || merged.voice.trim().length === 0) {
+        merged.voice = DEFAULT_CONFIG.voice;
+      }
+      if (typeof merged.workerUrl !== "string") {
+        merged.workerUrl = DEFAULT_CONFIG.workerUrl;
+      }
+      return merged;
     }
     static load() {
       try {
@@ -2726,13 +2930,13 @@
           const raw = GM_getValue(STORAGE_KEY, null);
           if (raw) {
             const parsed = JSON.parse(raw);
-            return { ...DEFAULT_CONFIG, ...parsed };
+            return this.normalizeConfig(parsed);
           }
         } else if (typeof localStorage !== "undefined") {
           const raw = localStorage.getItem(STORAGE_KEY);
           if (raw) {
             const parsed = JSON.parse(raw);
-            return { ...DEFAULT_CONFIG, ...parsed };
+            return this.normalizeConfig(parsed);
           }
         }
       } catch {
@@ -2741,7 +2945,7 @@
     }
     static save(patch) {
       const current = this.load();
-      const updated = { ...current, ...patch };
+      const updated = this.normalizeConfig({ ...current, ...patch });
       try {
         const serialized = JSON.stringify(updated);
         if (this.isGMSupported()) {
@@ -2758,10 +2962,15 @@
   function detectCharset(headers, buffer) {
     let headerCharset = "";
     if (typeof headers === "string") {
-      const match = headers.match(/charset=([a-zA-Z0-9_-]+)/i);
-      if (match) headerCharset = match[1].toLowerCase();
+      const ctMatch = headers.match(/content-type:[^\r\n]*charset=([a-zA-Z0-9_-]+)/i);
+      if (ctMatch) {
+        headerCharset = ctMatch[1].toLowerCase();
+      } else {
+        const match = headers.match(/charset=([a-zA-Z0-9_-]+)/i);
+        if (match) headerCharset = match[1].toLowerCase();
+      }
     } else if (headers && typeof headers === "object") {
-      const contentType = headers["content-type"] || headers["Content-Type"] || headers["content-type".toLowerCase()] || "";
+      const contentType = headers["content-type"] || headers["Content-Type"] || "";
       const match = contentType.match(/charset=([a-zA-Z0-9_-]+)/i);
       if (match) headerCharset = match[1].toLowerCase();
     }
@@ -2791,6 +3000,28 @@
       return "utf-8";
     }
     return enc;
+  }
+  async function normalizeArrayBuffer(rawResponse) {
+    let buffer = null;
+    if (rawResponse instanceof ArrayBuffer) {
+      buffer = rawResponse;
+    } else if (ArrayBuffer.isView(rawResponse)) {
+      const copy = new Uint8Array(rawResponse.byteLength);
+      copy.set(
+        new Uint8Array(
+          rawResponse.buffer,
+          rawResponse.byteOffset,
+          rawResponse.byteLength
+        )
+      );
+      buffer = copy.buffer;
+    } else if (typeof Blob !== "undefined" && rawResponse instanceof Blob) {
+      buffer = await rawResponse.arrayBuffer();
+    }
+    if (!buffer || buffer.byteLength === 0) {
+      throw new Error("抓取下一章返回空内容");
+    }
+    return buffer;
   }
   class ChapterLoader {
     constructor(initialUrl) {
@@ -2843,31 +3074,52 @@
       }
     }
     /**
-     * 同源通道：通过原生 window.fetch 获取 HTML（保留 Cookie 与防爬凭证）
+     * 同源通道：通过原生 window.fetch 获取 HTML（保留 Cookie 与防爬凭证，含 10000ms 超时）
      */
     async fetchChapterViaNativeFetch(targetUrl) {
-      const res = await window.fetch(targetUrl, {
-        method: "GET",
-        credentials: "include",
-        headers: {
-          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-        }
-      });
-      if (!res.ok) {
-        throw new Error(`同源 fetch 失败, HTTP ${res.status}`);
-      }
-      const buffer = await res.arrayBuffer();
-      if (!buffer || buffer.byteLength === 0) {
-        throw new Error("同源 fetch 返回空响应");
-      }
-      const contentType = res.headers.get("content-type") || "";
-      const charset = detectCharset(contentType, buffer);
+      var _a, _b;
+      const timeoutController = new AbortController();
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        timeoutController.abort();
+      }, 1e4);
       try {
-        const decoder = new TextDecoder(charset);
-        return decoder.decode(buffer);
-      } catch {
-        const fallbackDecoder = new TextDecoder("utf-8");
-        return fallbackDecoder.decode(buffer);
+        const fetchInit = {
+          method: "GET",
+          credentials: "include",
+          headers: {
+            Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+          },
+          signal: timeoutController.signal
+        };
+        if (typeof window !== "undefined" && ((_a = window.location) == null ? void 0 : _a.href)) {
+          fetchInit.referrer = window.location.href;
+        }
+        const res = await window.fetch(targetUrl, fetchInit);
+        if (!res.ok) {
+          throw new Error(`同源 fetch 失败, HTTP ${res.status}`);
+        }
+        const buffer = await res.arrayBuffer();
+        if (!buffer || buffer.byteLength === 0) {
+          throw new Error("同源 fetch 返回空响应");
+        }
+        const contentType = ((_b = res.headers) == null ? void 0 : _b.get("content-type")) || "";
+        const charset = detectCharset(contentType, buffer);
+        try {
+          const decoder = new TextDecoder(charset);
+          return decoder.decode(buffer);
+        } catch {
+          const fallbackDecoder = new TextDecoder("utf-8");
+          return fallbackDecoder.decode(buffer);
+        }
+      } catch (err) {
+        if (timedOut) {
+          throw new Error("同源 fetch 抓取下一章超时 (10000ms)");
+        }
+        throw err;
+      } finally {
+        clearTimeout(timer);
       }
     }
     /**
@@ -2925,23 +3177,23 @@
             // 附带 Cookie
             headers,
             timeout: 1e4,
-            onload: (resp) => {
+            onload: async (resp) => {
               if (resp.status < 200 || resp.status >= 300) {
                 finishError(new Error(`抓取下一章失败, HTTP ${resp.status}`));
                 return;
               }
-              const buffer = resp.response;
-              if (!buffer || buffer.byteLength === 0) {
-                finishError(new Error("抓取下一章返回空内容"));
-                return;
-              }
-              const charset = detectCharset(resp.responseHeaders || "", buffer);
               try {
-                const decoder = new TextDecoder(charset);
-                finishSuccess(decoder.decode(buffer));
-              } catch {
-                const fallbackDecoder = new TextDecoder("utf-8");
-                finishSuccess(fallbackDecoder.decode(buffer));
+                const buffer = await normalizeArrayBuffer(resp.response);
+                const charset = detectCharset(resp.responseHeaders || "", buffer);
+                try {
+                  const decoder = new TextDecoder(charset);
+                  finishSuccess(decoder.decode(buffer));
+                } catch {
+                  const fallbackDecoder = new TextDecoder("utf-8");
+                  finishSuccess(fallbackDecoder.decode(buffer));
+                }
+              } catch (err) {
+                finishError(err instanceof Error ? err : new Error(String(err)));
               }
             },
             onerror: (err) => finishError(new Error(`网络错误 (GM_xhr): ${JSON.stringify(err)}`)),
@@ -2967,21 +3219,36 @@
         return null;
       }
       let html = null;
+      let nativeFetchError = null;
       if (this.isSameOrigin(targetUrl) && typeof window.fetch === "function") {
         try {
           html = await this.fetchChapterViaNativeFetch(targetUrl);
         } catch (fetchErr) {
+          nativeFetchError = fetchErr instanceof Error ? fetchErr : new Error(String(fetchErr));
           console.warn("[NovelTTS] 同源 fetch 失败，回退至 GM_xmlhttpRequest:", fetchErr);
         }
       }
       if (!html) {
+        if (nativeFetchError && typeof GM_xmlhttpRequest !== "function") {
+          throw nativeFetchError;
+        }
         html = await this.fetchChapterViaGM(targetUrl);
       }
       const parser = new DOMParser();
       const doc = parser.parseFromString(html, "text/html");
       const content = extractChapterContent(doc, targetUrl);
-      this.visitedUrls.add(normalized);
+      if (content.paragraphs.length > 0) {
+        this.visitedUrls.add(normalized);
+      }
       return content;
+    }
+  }
+  class WorkerHttpError extends Error {
+    constructor(status, message) {
+      super(message);
+      __publicField(this, "status");
+      this.name = "WorkerHttpError";
+      this.status = status;
     }
   }
   class EdgeWorkerTTSProvider {
@@ -2992,33 +3259,49 @@
       __publicField(this, "timeoutMs");
       __publicField(this, "lastUsedSource", null);
       this.workerUrl = this.sanitizeUrl(options.workerUrl);
-      this.token = options.token;
+      this.token = this.sanitizeToken(options.token);
       this.timeoutMs = options.timeoutMs ?? 8e3;
     }
     sanitizeUrl(url) {
       return url.trim().replace(/\/+$/, "").replace(/\/tts\/?$/i, "");
+    }
+    sanitizeToken(token) {
+      const trimmed = (token ?? "").trim();
+      return trimmed || "dev-secret";
     }
     updateConfig(workerUrl, token) {
       if (workerUrl !== void 0) {
         this.workerUrl = this.sanitizeUrl(workerUrl);
       }
       if (token !== void 0) {
-        this.token = token;
+        this.token = this.sanitizeToken(token);
       }
     }
     getLastUsedSource() {
       return this.lastUsedSource;
     }
     buildUrl(text, options, customUrl, customToken) {
-      const baseUrl = customUrl ? this.sanitizeUrl(customUrl) : this.workerUrl;
-      const token = customToken !== void 0 ? customToken : this.token;
+      const baseUrl = customUrl !== void 0 ? this.sanitizeUrl(customUrl) : this.workerUrl;
+      if (!baseUrl) {
+        throw new Error("Worker 地址不能为空");
+      }
+      const token = customToken !== void 0 ? this.sanitizeToken(customToken) : this.sanitizeToken(this.token);
       const queryParams = new URLSearchParams({
         text: text.trim(),
         voice: options.voice || "zh-CN-XiaoxiaoNeural",
-        rate: String(options.rate || 1.2),
+        rate: String(options.rate || 1),
         token
       });
       return `${baseUrl}/tts?${queryParams.toString()}`;
+    }
+    createHttpError(status, statusText) {
+      if (status === 401) {
+        return new WorkerHttpError(401, "HTTP 401 密钥错误: 当前 Token 与 Worker 环境变量 AUTH_TOKEN 不一致");
+      }
+      if (status === 502) {
+        return new WorkerHttpError(502, "HTTP 502 上游异常: Edge TTS 微软服务端合成失败");
+      }
+      return new WorkerHttpError(status, `Edge Worker HTTP ${status}: ${statusText || "请求失败"}`);
     }
     /**
      * 将各种格式的响应转换为合法有效的 ArrayBuffer（校验 > 256 字节）
@@ -3046,30 +3329,57 @@
       return buffer;
     }
     /**
-     * 主通道：通过 window.fetch 获取音频
+     * 主通道：通过 window.fetch 获取音频（含超时与外部 AbortSignal 联动）
      */
     async synthesizeViaFetch(targetUrl, signal) {
-      const res = await window.fetch(targetUrl, {
-        method: "GET",
-        mode: "cors",
-        signal
-      });
-      if (!res.ok) {
-        if (res.status === 401) {
-          throw new Error("HTTP 401 密钥错误: 请检查 Worker Token 配置");
-        }
-        if (res.status === 502) {
-          throw new Error("HTTP 502 上游异常: Edge TTS 微软服务端合成失败");
-        }
-        throw new Error(`Edge Worker HTTP ${res.status}: ${res.statusText || "请求失败"}`);
+      if (signal == null ? void 0 : signal.aborted) {
+        throw new DOMException("The synthesis request was aborted", "AbortError");
       }
-      const buf = await res.arrayBuffer();
-      return this.normalizeAudioBuffer(buf);
+      const timeoutController = new AbortController();
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        timeoutController.abort();
+      }, this.timeoutMs);
+      const onExternalAbort = () => {
+        timeoutController.abort();
+      };
+      if (signal) {
+        signal.addEventListener("abort", onExternalAbort, { once: true });
+      }
+      try {
+        const res = await window.fetch(targetUrl, {
+          method: "GET",
+          mode: "cors",
+          signal: timeoutController.signal
+        });
+        if (!res.ok) {
+          throw this.createHttpError(res.status, res.statusText);
+        }
+        const buf = await res.arrayBuffer();
+        return await this.normalizeAudioBuffer(buf);
+      } catch (err) {
+        if (timedOut) {
+          throw new Error(`Edge Worker 请求超时 (${this.timeoutMs}ms)`);
+        }
+        if (signal == null ? void 0 : signal.aborted) {
+          throw new DOMException("The synthesis request was aborted", "AbortError");
+        }
+        throw err;
+      } finally {
+        clearTimeout(timer);
+        if (signal) {
+          signal.removeEventListener("abort", onExternalAbort);
+        }
+      }
     }
     /**
      * 兜底通道：通过 GM_xmlhttpRequest 获取音频（带 8500ms JS 超时保险丝）
      */
     async synthesizeViaGM(targetUrl, signal) {
+      if (signal == null ? void 0 : signal.aborted) {
+        throw new DOMException("The synthesis request was aborted", "AbortError");
+      }
       const gmRequest = typeof GM_xmlhttpRequest === "function" ? GM_xmlhttpRequest : null;
       if (!gmRequest) {
         throw new Error("GM_xmlhttpRequest 在当前环境中不可用");
@@ -3129,19 +3439,7 @@
             timeout: this.timeoutMs,
             onload: async (response) => {
               if (response.status < 200 || response.status >= 300) {
-                if (response.status === 401) {
-                  finishError(new Error("HTTP 401 密钥错误: 请检查 Worker Token 配置"));
-                  return;
-                }
-                if (response.status === 502) {
-                  finishError(new Error("HTTP 502 上游异常: Edge TTS 微软服务端合成失败"));
-                  return;
-                }
-                finishError(
-                  new Error(
-                    `Edge Worker HTTP ${response.status}: ${response.statusText || "请求失败"}`
-                  )
-                );
+                finishError(this.createHttpError(response.status, response.statusText));
                 return;
               }
               try {
@@ -3178,10 +3476,10 @@
         audioBuffer = await this.synthesizeViaFetch(targetUrl, options.signal);
         sourceUsed = "fetch";
       } catch (fetchErr) {
-        if (fetchErr.name === "AbortError") {
+        if ((fetchErr == null ? void 0 : fetchErr.name) === "AbortError") {
           throw fetchErr;
         }
-        if (fetchErr.message && fetchErr.message.startsWith("HTTP ")) {
+        if (fetchErr instanceof WorkerHttpError) {
           throw fetchErr;
         }
         if (typeof GM_xmlhttpRequest === "function") {
@@ -3189,6 +3487,9 @@
             audioBuffer = await this.synthesizeViaGM(targetUrl, options.signal);
             sourceUsed = "GM_xhr";
           } catch (gmErr) {
+            if ((gmErr == null ? void 0 : gmErr.name) === "AbortError") {
+              throw gmErr;
+            }
             throw new Error(`双通道请求均失败 (fetch: ${fetchErr.message}; GM: ${gmErr.message})`);
           }
         } else {
@@ -3209,15 +3510,15 @@
         voice: "zh-CN-XiaoxiaoNeural",
         rate: 1
       };
-      const targetUrl = this.buildUrl(testText, testOptions, customUrl, customToken);
       try {
+        const targetUrl = this.buildUrl(testText, testOptions, customUrl, customToken);
         let buffer;
         let source = "fetch";
         try {
           buffer = await this.synthesizeViaFetch(targetUrl);
           source = "fetch";
         } catch (fetchErr) {
-          if (fetchErr.message && fetchErr.message.startsWith("HTTP ")) {
+          if (fetchErr instanceof WorkerHttpError) {
             throw fetchErr;
           }
           if (typeof GM_xmlhttpRequest === "function") {
@@ -3250,15 +3551,11 @@
       __publicField(this, "shadow");
       __publicField(this, "events");
       // 状态引用
-      __publicField(this, "isExpanded", false);
       __publicField(this, "isSettingsOpen", false);
       __publicField(this, "playerState", "idle");
-      __publicField(this, "currentProgress", { index: 0, total: 0, text: "" });
-      __publicField(this, "currentChapterTitle", "小说听书");
       __publicField(this, "currentChapterUrl", null);
-      __publicField(this, "currentRate", 1.2);
-      __publicField(this, "currentVoice", "zh-CN-XiaoxiaoNeural");
-      __publicField(this, "ballPosition", { side: "right", offsetTop: 0 });
+      __publicField(this, "currentRate", 1);
+      __publicField(this, "ballPosition", null);
       // DOM 元素引用
       __publicField(this, "ballEl");
       __publicField(this, "panelEl");
@@ -3276,19 +3573,34 @@
       __publicField(this, "testResultEl");
       __publicField(this, "jumpChapterBtn");
       __publicField(this, "toastTimer", null);
+      // 需清理的全局监听器引用
+      __publicField(this, "onWindowTouchMove", null);
+      __publicField(this, "onWindowTouchEnd", null);
+      __publicField(this, "onWindowMouseMove", null);
+      __publicField(this, "onWindowMouseUp", null);
+      __publicField(this, "onWindowResize", null);
       this.events = events;
       this.currentRate = config.rate;
-      this.currentVoice = config.voice;
-      if (config.ballPosition) {
-        this.ballPosition = config.ballPosition;
-      }
-      this.host = document.createElement("div");
+      this.ballPosition = config.ballPosition ?? null;
+      this.host = document.createElement("novel-tts-host");
       this.host.id = "novel-tts-floating-root";
+      this.applyHostStyles();
       this.shadow = this.host.attachShadow({ mode: "open" });
       this.render(config);
       this.applyBallPosition();
       this.bindEvents();
       this.bindDragEvents();
+    }
+    applyHostStyles() {
+      this.host.style.setProperty("position", "fixed", "important");
+      this.host.style.setProperty("inset", "0", "important");
+      this.host.style.setProperty("z-index", "2147483647", "important");
+      this.host.style.setProperty("pointer-events", "none", "important");
+      this.host.style.setProperty("display", "block", "important");
+      this.host.style.setProperty("margin", "0", "important");
+      this.host.style.setProperty("padding", "0", "important");
+      this.host.style.setProperty("border", "0", "important");
+      this.host.style.setProperty("background", "transparent", "important");
     }
     mount(parent) {
       const target = parent || document.documentElement || document.body;
@@ -3297,15 +3609,39 @@
       }
     }
     unmount() {
+      if (this.toastTimer !== null) {
+        clearTimeout(this.toastTimer);
+        this.toastTimer = null;
+      }
+      if (this.onWindowTouchMove) {
+        window.removeEventListener("touchmove", this.onWindowTouchMove);
+        this.onWindowTouchMove = null;
+      }
+      if (this.onWindowTouchEnd) {
+        window.removeEventListener("touchend", this.onWindowTouchEnd);
+        this.onWindowTouchEnd = null;
+      }
+      if (this.onWindowMouseMove) {
+        window.removeEventListener("mousemove", this.onWindowMouseMove);
+        this.onWindowMouseMove = null;
+      }
+      if (this.onWindowMouseUp) {
+        window.removeEventListener("mouseup", this.onWindowMouseUp);
+        this.onWindowMouseUp = null;
+      }
+      if (this.onWindowResize) {
+        window.removeEventListener("resize", this.onWindowResize);
+        this.onWindowResize = null;
+      }
       if (this.host.parentNode) {
         this.host.parentNode.removeChild(this.host);
       }
     }
     toggleVisible() {
       if (this.host.style.display === "none") {
-        this.host.style.display = "block";
+        this.host.style.setProperty("display", "block", "important");
       } else {
-        this.host.style.display = "none";
+        this.host.style.setProperty("display", "none", "important");
       }
     }
     // ─── 状态更新接口 ──────────────────────────────────────────────────────
@@ -3315,12 +3651,10 @@
       this.updateBallAnimation();
     }
     updateProgress(index, total, sentence) {
-      this.currentProgress = { index, total, text: sentence };
       this.progressEl.textContent = `${index + 1} / ${total}`;
       this.textEl.textContent = sentence || "正在准备朗读…";
     }
-    updateChapter(title, nextUrl, currentUrl) {
-      this.currentChapterTitle = title;
+    updateChapter(title, currentUrl) {
       this.titleEl.textContent = title;
       if (currentUrl) {
         this.currentChapterUrl = currentUrl;
@@ -3329,14 +3663,19 @@
         this.jumpChapterBtn.style.display = "none";
       }
     }
+    syncConfigInputs(workerUrl, token) {
+      this.workerInput.value = workerUrl;
+      this.tokenInput.value = token;
+    }
     showToast(message, duration = 3e3) {
-      if (this.toastTimer) {
+      if (this.toastTimer !== null) {
         clearTimeout(this.toastTimer);
       }
       this.toastEl.textContent = message;
       this.toastEl.classList.add("visible");
       this.toastTimer = setTimeout(() => {
         this.toastEl.classList.remove("visible");
+        this.toastTimer = null;
       }, duration);
     }
     // ─── DOM 渲染 ─────────────────────────────────────────────────────────
@@ -3350,8 +3689,6 @@
         line-height: 1.4;
         color: #f1f5f9;
         -webkit-tap-highlight-color: transparent;
-        z-index: 2147483647 !important;
-        position: relative;
       }
 
       /* 悬浮小球 (折叠态) */
@@ -3372,6 +3709,7 @@
         cursor: grab;
         user-select: none;
         touch-action: none;
+        pointer-events: auto;
         transition: box-shadow 0.2s, background 0.2s;
         z-index: 2147483647;
       }
@@ -3407,6 +3745,7 @@
         box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.45);
         padding: 14px 16px env(safe-area-inset-bottom, 14px);
         box-sizing: border-box;
+        pointer-events: auto;
         transform: translateY(105%);
         transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1);
         z-index: 2147483647;
@@ -3473,22 +3812,25 @@
         color: #94a3b8;
       }
 
-      /* 当前朗读句预览 (严格2行高度，不露第3行半截) */
+      /* 当前朗读句预览 (外层负责 padding，内层精准 2 行截断防露出第 3 行半截) */
+      .sentence-preview-wrap {
+        background: rgba(255, 255, 255, 0.04);
+        padding: 6px 10px;
+        border-radius: 6px;
+        margin-bottom: 12px;
+      }
       .sentence-preview {
+        padding: 0;
+        margin: 0;
         font-size: 13px;
         line-height: 1.5;
-        height: 39px;
+        min-height: 39px;
         max-height: 39px;
-        margin-bottom: 12px;
         overflow: hidden;
         text-overflow: ellipsis;
         display: -webkit-box;
         -webkit-line-clamp: 2;
         -webkit-box-orient: vertical;
-        background: rgba(255, 255, 255, 0.04);
-        padding: 6px 10px;
-        border-radius: 6px;
-        box-sizing: content-box;
       }
 
       /* 控制按钮主行 */
@@ -3695,7 +4037,9 @@
           </div>
         </div>
 
-        <div class="sentence-preview" id="tts-sentence">点击播放开始听书…</div>
+        <div class="sentence-preview-wrap">
+          <div class="sentence-preview" id="tts-sentence">点击播放开始听书…</div>
+        </div>
 
         <!-- 主控区 -->
         <div class="controls">
@@ -3730,11 +4074,11 @@
         <div class="settings-drawer" id="tts-drawer">
           <div class="field">
             <label>Edge TTS Worker 地址 (URL)</label>
-            <input type="text" id="tts-worker-url" placeholder="http://localhost:8787 或 CF Worker 域名" value="${config.workerUrl}"/>
+            <input type="text" id="tts-worker-url" placeholder="https://xxx.workers.dev 或 http://localhost:8787" />
           </div>
           <div class="field">
-            <label>Worker 鉴权密钥 (Token)</label>
-            <input type="text" id="tts-token" placeholder="dev-secret" value="${config.token}"/>
+            <label>Worker 鉴权密钥 (Token，默认 dev-secret)</label>
+            <input type="text" id="tts-token" placeholder="dev-secret" />
           </div>
           <div style="display: flex; gap: 8px; margin-top: 6px;">
             <button class="save-btn" id="tts-save-config" style="flex: 1;">保存配置</button>
@@ -3764,14 +4108,21 @@
       this.testBtn = this.shadow.querySelector("#tts-test-config");
       this.testResultEl = this.shadow.querySelector("#tts-test-result");
       this.jumpChapterBtn = this.shadow.querySelector("#tts-jump");
+      this.workerInput.value = config.workerUrl;
+      this.tokenInput.value = config.token;
       this.voiceSelect.value = config.voice;
     }
+    clampOffsetTop(offsetTop) {
+      const maxTop = Math.max(60, window.innerHeight - 80);
+      return Math.max(60, Math.min(maxTop, offsetTop));
+    }
     applyBallPosition() {
-      if (!this.ballPosition || !this.ballPosition.offsetTop) {
+      if (!this.ballPosition) {
         return;
       }
       const { side, offsetTop } = this.ballPosition;
-      this.ballEl.style.top = `${offsetTop}px`;
+      const clampedTop = this.clampOffsetTop(offsetTop);
+      this.ballEl.style.top = `${clampedTop}px`;
       this.ballEl.style.bottom = "auto";
       if (side === "left") {
         this.ballEl.style.left = "12px";
@@ -3809,8 +4160,8 @@
         if (hasMoved) {
           let currentLeft = initialLeft + dx;
           let currentTop = initialTop + dy;
-          const maxX = window.innerWidth - 46;
-          const maxY = window.innerHeight - 46;
+          const maxX = Math.max(0, window.innerWidth - 46);
+          const maxY = Math.max(40, window.innerHeight - 46);
           currentLeft = Math.max(0, Math.min(maxX, currentLeft));
           currentTop = Math.max(40, Math.min(maxY - 40, currentTop));
           this.ballEl.style.left = `${currentLeft}px`;
@@ -3827,7 +4178,6 @@
         if (hasMoved) {
           const rect = this.ballEl.getBoundingClientRect();
           const screenWidth = window.innerWidth;
-          const screenHeight = window.innerHeight;
           const ballCenterX = rect.left + rect.width / 2;
           let side = "right";
           if (ballCenterX < screenWidth / 2) {
@@ -3839,42 +4189,55 @@
             this.ballEl.style.right = "12px";
             this.ballEl.style.left = "auto";
           }
-          const offsetTop = Math.max(60, Math.min(screenHeight - 80, rect.top));
+          const offsetTop = this.clampOffsetTop(rect.top);
           this.ballEl.style.top = `${offsetTop}px`;
           this.ballEl.style.bottom = "auto";
           this.ballPosition = { side, offsetTop };
           (_b = (_a = this.events).onBallPositionChange) == null ? void 0 : _b.call(_a, this.ballPosition);
         }
       };
-      this.ballEl.addEventListener("touchstart", (e) => {
-        if (e.touches.length === 1) {
-          onStart(e.touches[0].clientX, e.touches[0].clientY);
-        }
-      }, { passive: true });
-      window.addEventListener("touchmove", (e) => {
+      this.ballEl.addEventListener(
+        "touchstart",
+        (e) => {
+          if (e.touches.length === 1) {
+            onStart(e.touches[0].clientX, e.touches[0].clientY);
+          }
+        },
+        { passive: true }
+      );
+      this.onWindowTouchMove = (e) => {
         if (isDragging && e.touches.length === 1) {
           onMove(e.touches[0].clientX, e.touches[0].clientY);
         }
-      }, { passive: true });
-      window.addEventListener("touchend", () => {
+      };
+      this.onWindowTouchEnd = () => {
         onEnd();
-      });
+      };
+      window.addEventListener("touchmove", this.onWindowTouchMove, { passive: true });
+      window.addEventListener("touchend", this.onWindowTouchEnd);
       this.ballEl.addEventListener("mousedown", (e) => {
         if (e.button === 0) {
           onStart(e.clientX, e.clientY);
         }
       });
-      window.addEventListener("mousemove", (e) => {
+      this.onWindowMouseMove = (e) => {
         if (isDragging) {
           onMove(e.clientX, e.clientY);
         }
-      });
-      window.addEventListener("mouseup", () => {
+      };
+      this.onWindowMouseUp = () => {
         onEnd();
-      });
+      };
+      window.addEventListener("mousemove", this.onWindowMouseMove);
+      window.addEventListener("mouseup", this.onWindowMouseUp);
+      this.onWindowResize = () => {
+        this.applyBallPosition();
+      };
+      window.addEventListener("resize", this.onWindowResize);
       this.ballEl.addEventListener("click", (e) => {
         if (hasMoved) {
           e.stopPropagation();
+          hasMoved = false;
           return;
         }
         this.expandPanel();
@@ -3907,8 +4270,7 @@
         this.showToast(`语速已切换为 ${this.currentRate.toFixed(1)}x`);
       });
       this.voiceSelect.addEventListener("change", () => {
-        this.currentVoice = this.voiceSelect.value;
-        this.events.onVoiceChange(this.currentVoice);
+        this.events.onVoiceChange(this.voiceSelect.value);
         this.showToast("音色已更新");
       });
       this.shadow.querySelector("#tts-gear").addEventListener("click", () => {
@@ -3921,7 +4283,6 @@
         this.events.onSaveConfig(url, token);
         this.isSettingsOpen = false;
         this.settingsDrawer.classList.remove("open");
-        this.showToast("配置已保存并生效");
       });
       this.testBtn.addEventListener("click", async () => {
         const url = this.workerInput.value.trim();
@@ -3963,12 +4324,10 @@
       });
     }
     expandPanel() {
-      this.isExpanded = true;
       this.panelEl.classList.add("open");
       this.ballEl.style.display = "none";
     }
     collapsePanel() {
-      this.isExpanded = false;
       this.panelEl.classList.remove("open");
       this.ballEl.style.display = "flex";
     }
@@ -4005,7 +4364,8 @@
     const chapterLoader = new ChapterLoader(window.location.href);
     let currentChapter = null;
     let nextChapterUrl = null;
-    let isActionPending = false;
+    let lastSeenHref = window.location.href;
+    let isChapterLoading = false;
     const player = new NovelPlayer({
       provider: workerProvider,
       voice: config.voice,
@@ -4021,17 +4381,44 @@
           bar.showToast(msg);
         },
         onChapterEnd: () => {
-          handleAutoNextChapter(false);
+          void handleAutoNextChapter(false);
         }
       }
     });
+    const ensureCurrentChapterParsed = () => {
+      const href = window.location.href;
+      if (!currentChapter || currentChapter.paragraphs.length === 0 || lastSeenHref !== href) {
+        bar.showToast("正在解析小说正文…");
+        const extracted = extractChapterContent(document, href);
+        lastSeenHref = href;
+        if (!extracted || extracted.paragraphs.length === 0) {
+          currentChapter = null;
+          nextChapterUrl = (extracted == null ? void 0 : extracted.nextChapterUrl) ?? null;
+          return null;
+        }
+        currentChapter = extracted;
+        nextChapterUrl = extracted.nextChapterUrl;
+        chapterLoader.markVisited(href);
+        bar.updateChapter(extracted.title);
+      }
+      return currentChapter;
+    };
     const handleAutoNextChapter = async (isManual = false) => {
+      if (isManual) {
+        player.unlockAllAudio({ audio: true, speech: true });
+      }
+      if (isChapterLoading) return;
+      if (!nextChapterUrl) {
+        nextChapterUrl = extractNextChapterUrl(document, window.location.href);
+      }
       if (!nextChapterUrl) {
         bar.showToast("已播放至最后一章");
         return;
       }
-      if (isActionPending) return;
-      isActionPending = true;
+      if (player.getState() !== "idle") {
+        player.stop();
+      }
+      isChapterLoading = true;
       bar.showToast("正在加载下一章…");
       const targetUrl = nextChapterUrl;
       try {
@@ -4041,65 +4428,67 @@
         }
         currentChapter = loaded;
         nextChapterUrl = loaded.nextChapterUrl;
-        bar.updateChapter(loaded.title, loaded.nextChapterUrl, targetUrl);
+        bar.updateChapter(loaded.title, targetUrl);
         bar.showToast(`已开始播放：${loaded.title}`);
         try {
           window.history.replaceState(null, "", targetUrl);
           document.title = loaded.title;
         } catch {
         }
+        lastSeenHref = window.location.href;
+        if (!ConfigStorage.load().workerUrl.trim()) {
+          player.switchToFallback();
+        }
         await player.playChapter(loaded);
       } catch (err) {
         console.warn("[NovelTTS] Failed to load next chapter silently:", err);
         if (isManual) {
-          bar.showToast("防爬限制，正在直接跳转下一章…");
+          bar.showToast("静默加载受限，正在直接跳转下一章…");
           setTimeout(() => {
             window.location.href = targetUrl;
           }, 300);
         } else {
-          bar.showToast(`下一章加载失败: ${(err == null ? void 0 : err.message) || err}`);
+          bar.showToast(`下一章自动加载失败 (${(err == null ? void 0 : err.message) || err})，可点下一章直接跳转`);
         }
       } finally {
-        isActionPending = false;
+        isChapterLoading = false;
       }
     };
     const bar = new FloatingBar(config, {
       onPlayToggle: async () => {
-        player.unlockAllAudio();
-        if (isActionPending) return;
-        isActionPending = true;
+        if (isChapterLoading) {
+          bar.showToast("正在加载下一章，请稍候…");
+          return;
+        }
+        const state = player.getState();
+        if (state === "playing" || state === "loading") {
+          player.pause();
+          return;
+        }
+        if (state === "paused") {
+          if (!player.isFallbackMode()) {
+            player.unlockAllAudio({ audio: true, speech: false });
+          }
+          player.resume();
+          return;
+        }
+        const currentCfg = ConfigStorage.load();
+        const hasWorker = Boolean(currentCfg.workerUrl.trim());
+        if (hasWorker) {
+          player.unlockAllAudio({ audio: true, speech: true });
+        } else {
+          player.switchToFallback("未配置 Worker，已自动使用系统语音朗读（可点齿轮配置）");
+        }
         try {
-          const state = player.getState();
-          if (state === "playing") {
-            player.pause();
+          const chapter = ensureCurrentChapterParsed();
+          if (!chapter) {
+            bar.showToast("未识别到小说正文，无法播放");
             return;
           }
-          if (state === "paused") {
-            player.resume();
-            return;
-          }
-          const currentCfg = ConfigStorage.load();
-          if (!currentCfg.workerUrl) {
-            player.switchToFallback("未配置 Worker，已自动使用系统语音朗读（可点齿轮配置）");
-          }
-          if (!currentChapter || currentChapter.paragraphs.length === 0) {
-            bar.showToast("正在解析小说正文…");
-            const extracted = extractChapterContent(document, window.location.href);
-            if (!extracted || extracted.paragraphs.length === 0) {
-              bar.showToast("未识别到小说正文，无法播放");
-              return;
-            }
-            currentChapter = extracted;
-            nextChapterUrl = extracted.nextChapterUrl;
-            chapterLoader.markVisited(window.location.href);
-            bar.updateChapter(extracted.title, extracted.nextChapterUrl);
-          }
-          await player.playChapter(currentChapter);
+          await player.playChapter(chapter);
         } catch (err) {
           console.error("[NovelTTS] Play error:", err);
           bar.showToast(`播放失败: ${(err == null ? void 0 : err.message) || err}`);
-        } finally {
-          isActionPending = false;
         }
       },
       onNextSentence: () => {
@@ -4109,7 +4498,7 @@
         player.previousSentence();
       },
       onNextChapter: () => {
-        handleAutoNextChapter(true);
+        void handleAutoNextChapter(true);
       },
       onRateChange: (rate) => {
         player.setRate(rate);
@@ -4120,13 +4509,22 @@
         ConfigStorage.save({ voice });
       },
       onSaveConfig: (workerUrl, token) => {
-        ConfigStorage.save({ workerUrl, token });
-        workerProvider.updateConfig(workerUrl, token);
-        player.setProvider(workerProvider);
-        bar.showToast("配置已保存并生效");
+        const trimmedUrl = workerUrl.trim();
+        const effectiveToken = token.trim() || "dev-secret";
+        ConfigStorage.save({ workerUrl: trimmedUrl, token: effectiveToken });
+        bar.syncConfigInputs(trimmedUrl, effectiveToken);
+        if (trimmedUrl) {
+          workerProvider.updateConfig(trimmedUrl, effectiveToken);
+          player.setProvider(workerProvider);
+          bar.showToast("配置已保存并生效");
+        } else {
+          workerProvider.updateConfig("", effectiveToken);
+          player.switchToFallback("已清空 Worker 地址，将使用系统语音朗读");
+        }
       },
       onTestConfig: async (workerUrl, token) => {
-        return await workerProvider.testConnection(workerUrl, token);
+        const effectiveToken = token.trim() || "dev-secret";
+        return await workerProvider.testConnection(workerUrl, effectiveToken);
       },
       onJumpChapterUrl: (url) => {
         window.location.href = url;
