@@ -2,7 +2,7 @@
  * Cloudflare Worker — Edge TTS Proxy
  *
  * GET /tts?text=...&voice=...&rate=...&token=...
- *   → Connects to Microsoft Edge TTS via WebSocket
+ *   → Connects to Microsoft Edge TTS via WebSocket (Sec-MS-GEC v2)
  *   → Returns synthesized audio as audio/mpeg
  *
  * GET /health  → { "status": "ok" }
@@ -10,21 +10,29 @@
  * Auth: `token` query param must match env.AUTH_TOKEN (default "dev-secret").
  */
 
+import {
+  CHROMIUM_MAJOR_VERSION,
+  SEC_MS_GEC_VERSION,
+  TRUSTED_CLIENT_TOKEN,
+  generateMuid,
+  generateSecMsGecV2,
+} from "./drm";
+
 // ─── Constants ────────────────────────────────────────────────────────
 
-const TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
-// Keep this in sync with a recent Chromium-based Edge build. Microsoft rejects
-// otherwise valid Sec-MS-GEC hashes when this value becomes too old.
-const SEC_MS_GEC_VERSION = "1-143.0.3650.75";
-const WSS_BASE = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1";
+const EDGE_TTS_HTTPS_BASE =
+  "https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1";
 const OUTPUT_FORMAT = "audio-24khz-48kbitrate-mono-mp3";
 const SYNTHESIS_TIMEOUT_MS = 15_000;
+const MAX_TEXT_LENGTH = 2000;
 
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
+
+let clockSkewSec = 0;
 
 // ─── Types ────────────────────────────────────────────────────────────
 
@@ -37,30 +45,6 @@ interface Env {
 /** UUID without hyphens, used as ConnectionId / RequestId. */
 function newId(): string {
   return crypto.randomUUID().replace(/-/g, "");
-}
-
-/**
- * Compute Sec-MS-GEC token.
- * Algorithm: SHA-256( roundedWindowsTicks + TrustedClientToken )
- * where ticks are 100-ns intervals since 0001-01-01, rounded to 5-min.
- */
-async function generateSecMsGec(): Promise<string> {
-  const WIN_EPOCH = 11644473600n;
-  const TICKS_PER_SEC = 10_000_000n;
-  const ROUND = 3_000_000_000n;
-
-  const nowSec = BigInt(Math.floor(Date.now() / 1000));
-  const ticks = (nowSec + WIN_EPOCH) * TICKS_PER_SEC;
-  const rounded = ticks - (ticks % ROUND);
-
-  const payload = new TextEncoder().encode(
-    `${rounded}${TRUSTED_CLIENT_TOKEN}`,
-  );
-  const digest = await crypto.subtle.digest("SHA-256", payload);
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("")
-    .toUpperCase();
 }
 
 function escapeXml(s: string): string {
@@ -109,41 +93,66 @@ function concat(chunks: Uint8Array[]): Uint8Array {
 
 // ─── Edge TTS synthesis via WebSocket ─────────────────────────────────
 
-async function synthesize(
-  text: string,
-  voice: string,
-  rate: number,
-): Promise<Uint8Array> {
+async function openEdgeWebSocket(allowSkewRetry = true): Promise<WebSocket> {
   const connId = newId();
-  const gec = await generateSecMsGec();
+  const gec = generateSecMsGecV2(clockSkewSec);
 
   const wsUrl =
-    `${WSS_BASE}` +
+    `${EDGE_TTS_HTTPS_BASE}` +
     `?TrustedClientToken=${TRUSTED_CLIENT_TOKEN}` +
     `&Sec-MS-GEC=${gec}` +
     `&Sec-MS-GEC-Version=${SEC_MS_GEC_VERSION}` +
     `&ConnectionId=${connId}`;
 
-  // Try CF Workers fetch-upgrade first; fall back to standard WebSocket
-  let ws: WebSocket;
-  try {
-    const resp = await fetch(wsUrl.replace("wss://", "https://"), {
-      headers: { Upgrade: "websocket" },
-    });
-    if (resp.webSocket) {
-      ws = resp.webSocket;
-      ws.accept();
-    } else {
-      throw new Error("fetch upgrade returned no webSocket property");
+  const resp = await fetch(wsUrl, {
+    headers: {
+      Upgrade: "websocket",
+      Pragma: "no-cache",
+      "Cache-Control": "no-cache",
+      Origin: "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold",
+      "User-Agent":
+        `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ` +
+        `(KHTML, like Gecko) Chrome/${CHROMIUM_MAJOR_VERSION}.0.0.0 Safari/537.36 Edg/${CHROMIUM_MAJOR_VERSION}.0.0.0`,
+      "Accept-Language": "en-US,en;q=0.9",
+      Cookie: `muid=${generateMuid()};`,
+    },
+  });
+
+  if (resp.webSocket) {
+    resp.webSocket.accept();
+    try {
+      (resp.webSocket as unknown as { binaryType?: string }).binaryType =
+        "arraybuffer";
+    } catch {
+      /* ignore if runtime disallows setting binaryType */
     }
-  } catch {
-    // Fallback: standard WebSocket constructor (works in workerd with
-    // nodejs_compat flag and recent compat dates)
-    ws = new WebSocket(wsUrl);
+    return resp.webSocket;
   }
 
+  // 时钟偏移自动校准：403 时解析服务端 Date 头校准一次并重试
+  if (allowSkewRetry && resp.status === 403) {
+    const serverDate = resp.headers.get("Date");
+    if (serverDate) {
+      const serverMs = Date.parse(serverDate);
+      if (Number.isFinite(serverMs)) {
+        clockSkewSec = serverMs / 1000 - Date.now() / 1000;
+        return openEdgeWebSocket(false);
+      }
+    }
+  }
+
+  throw new Error(`Edge TTS upstream HTTP ${resp.status} ${resp.statusText || ""}`.trim());
+}
+
+async function synthesize(
+  text: string,
+  voice: string,
+  rate: number,
+): Promise<Uint8Array> {
+  const ws = await openEdgeWebSocket(true);
+
   return new Promise<Uint8Array>((resolve, reject) => {
-    const chunks: Uint8Array[] = [];
+    const chunkTasks: Array<Promise<Uint8Array | null>> = [];
     let settled = false;
 
     const finish = (fn: () => void) => {
@@ -157,105 +166,125 @@ async function synthesize(
       finish(() => {
         try {
           ws.close();
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
         reject(new Error("TTS synthesis timed out"));
       });
     }, SYNTHESIS_TIMEOUT_MS);
 
-    // ── Handler to send config + SSML once connected ──
-    const onOpen = () => {
-      // 1. speech.config
-      const configPayload = JSON.stringify({
-        context: {
-          synthesis: {
-            audio: {
-              metadataoptions: {
-                sentenceBoundaryEnabled: "false",
-                wordBoundaryEnabled: "false",
-              },
-              outputFormat: OUTPUT_FORMAT,
-            },
+    const finalizeAudio = (emptyError: string) => {
+      finish(() => {
+        try {
+          ws.close();
+        } catch {
+          /* ignore */
+        }
+        void Promise.all(chunkTasks).then(
+          (parts) => {
+            const valid = parts.filter(
+              (p): p is Uint8Array => p !== null && p.byteLength > 0,
+            );
+            const out = concat(valid);
+            if (out.byteLength === 0) {
+              reject(new Error(emptyError));
+              return;
+            }
+            resolve(out);
           },
-        },
+          (err) => {
+            reject(err instanceof Error ? err : new Error(String(err)));
+          },
+        );
       });
-      ws.send(
-        `X-Timestamp:${new Date().toISOString()}\r\n` +
-          `Content-Type:application/json; charset=utf-8\r\n` +
-          `Path:speech.config\r\n\r\n${configPayload}`,
-      );
-
-      // 2. SSML
-      const reqId = newId();
-      const ts = new Date().toISOString();
-      const ssml = buildSSML(text, voice, rate);
-      ws.send(
-        `X-RequestId:${reqId}\r\n` +
-          `Content-Type:application/ssml+xml\r\n` +
-          `X-Timestamp:${ts}\r\n` +
-          `Path:ssml\r\n\r\n${ssml}`,
-      );
     };
 
-    // ── Handler for incoming data ──
+    const sendSynthesisMessages = () => {
+      try {
+        // 1. speech.config
+        const configPayload = JSON.stringify({
+          context: {
+            synthesis: {
+              audio: {
+                metadataoptions: {
+                  sentenceBoundaryEnabled: "false",
+                  wordBoundaryEnabled: "false",
+                },
+                outputFormat: OUTPUT_FORMAT,
+              },
+            },
+          },
+        });
+        ws.send(
+          `X-Timestamp:${new Date().toISOString()}\r\n` +
+            `Content-Type:application/json; charset=utf-8\r\n` +
+            `Path:speech.config\r\n\r\n${configPayload}`,
+        );
+
+        // 2. SSML
+        const reqId = newId();
+        const ts = new Date().toISOString();
+        const ssml = buildSSML(text, voice, rate);
+        ws.send(
+          `X-RequestId:${reqId}\r\n` +
+            `Content-Type:application/ssml+xml\r\n` +
+            `X-Timestamp:${ts}\r\n` +
+            `Path:ssml\r\n\r\n${ssml}`,
+        );
+      } catch (sendErr: unknown) {
+        finish(() => {
+          try {
+            ws.close();
+          } catch {
+            /* ignore */
+          }
+          reject(sendErr instanceof Error ? sendErr : new Error(String(sendErr)));
+        });
+      }
+    };
+
     const onMessage = (evt: MessageEvent) => {
       if (settled) return;
 
       if (typeof evt.data === "string") {
         if (evt.data.includes("Path:turn.end")) {
-          finish(() => {
-            try {
-              ws.close();
-            } catch { /* ignore */ }
-            resolve(concat(chunks));
-          });
+          finalizeAudio("Edge TTS returned empty audio");
         }
-      } else {
-        // Binary frame — could be ArrayBuffer or Buffer (Node compat)
-        let bytes: Uint8Array;
-        if (evt.data instanceof ArrayBuffer) {
-          bytes = new Uint8Array(evt.data);
-        } else if (ArrayBuffer.isView(evt.data)) {
-          bytes = new Uint8Array(
-            evt.data.buffer,
-            evt.data.byteOffset,
-            evt.data.byteLength,
-          );
-        } else {
-          return; // unknown type, skip
-        }
-        const audio = extractAudioPayload(bytes);
-        if (audio && audio.length > 0) {
-          chunks.push(audio);
-        }
+      } else if (evt.data instanceof ArrayBuffer) {
+        chunkTasks.push(
+          Promise.resolve(extractAudioPayload(new Uint8Array(evt.data))),
+        );
+      } else if (ArrayBuffer.isView(evt.data)) {
+        const view = evt.data;
+        chunkTasks.push(
+          Promise.resolve(
+            extractAudioPayload(
+              new Uint8Array(view.buffer, view.byteOffset, view.byteLength),
+            ),
+          ),
+        );
+      } else if (typeof Blob !== "undefined" && evt.data instanceof Blob) {
+        const blob = evt.data;
+        chunkTasks.push(
+          blob.arrayBuffer().then((buf) => extractAudioPayload(new Uint8Array(buf))),
+        );
       }
     };
 
     const onClose = () => {
-      finish(() => {
-        if (chunks.length > 0) {
-          resolve(concat(chunks));
-        } else {
-          reject(new Error("WebSocket closed before receiving audio data"));
-        }
-      });
+      finalizeAudio("WebSocket closed before receiving audio data");
     };
 
     const onError = () => {
-      finish(() =>
-        reject(new Error("WebSocket error during TTS synthesis")),
-      );
+      finish(() => reject(new Error("WebSocket error during TTS synthesis")));
     };
 
-    // For CF Workers' accepted websocket, `open` has already fired.
-    // Check readyState to decide whether we need an open listener.
-    if ((ws as any).readyState === 1 /* OPEN */) {
-      onOpen();
-    } else {
-      ws.addEventListener("open", onOpen);
-    }
     ws.addEventListener("message", onMessage);
     ws.addEventListener("close", onClose);
     ws.addEventListener("error", onError);
+
+    // CF Workers fetch-upgrade 返回的 WebSocket 在 accept() 后已处于可用状态
+    sendSynthesisMessages();
   });
 }
 
@@ -301,6 +330,15 @@ export default {
         headers: CORS_HEADERS,
       });
     }
+    if (text.length > MAX_TEXT_LENGTH) {
+      return new Response(
+        `Bad Request: 'text' exceeds maximum length of ${MAX_TEXT_LENGTH}`,
+        {
+          status: 400,
+          headers: CORS_HEADERS,
+        },
+      );
+    }
 
     const voice =
       url.searchParams.get("voice") || "zh-CN-XiaoxiaoNeural";
@@ -319,7 +357,7 @@ export default {
         headers: {
           "Content-Type": "audio/mpeg",
           "Content-Length": String(audio.byteLength),
-          "Cache-Control": "public, max-age=86400",
+          "Cache-Control": "private, max-age=86400",
           ...CORS_HEADERS,
         },
       });
