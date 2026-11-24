@@ -320,4 +320,53 @@ describe('readerView.ts & floatingBar.ts - 阅读模式(目录+无限滚动)与�
     (barShadow.querySelector('#tts-reader-open') as HTMLButtonElement).click();
     expect(onOpenReader).toHaveBeenCalledTimes(1);
   });
+
+  it('挂载于 documentElement 时彻底隔离底层页面与广告横幅（z-index 2147483646），并支持章尾重试加载与自定义重试提示', () => {
+    const onRetryAppendNext = vi.fn();
+    const scrollToSpy = vi.spyOn(window, 'scrollTo').mockImplementation(() => {});
+    const origScrollYDesc = Object.getOwnPropertyDescriptor(window, 'scrollY');
+    Object.defineProperty(window, 'scrollY', { value: 320, configurable: true });
+
+    try {
+      readerView = new ReaderView(makeConfig(), makeEvents({ onRetryAppendNext }));
+      readerView.mount(document.documentElement);
+
+      const ch1 = makeLoadedChapter(
+        'https://example.com/1.html',
+        '第1章',
+        ['第一章正文长度超过三十个字用来验证阅读模式页面隔离和章尾重试功能。'],
+        'https://example.com/2.html'
+      );
+      readerView.replaceChapter(ch1);
+
+      const rootHost = document.getElementById('novel-tts-reader-root')!;
+      expect(rootHost.style.getPropertyValue('z-index')).toBe('2147483646');
+
+      readerView.open();
+      expect(document.documentElement.classList.contains('novel-tts-reader-active')).toBe(true);
+      const isoStyle = document.getElementById('novel-tts-reader-host-isolation');
+      expect(isoStyle).not.toBeNull();
+      expect(isoStyle!.textContent).toContain('html.novel-tts-reader-active');
+
+      const shadow = rootHost.shadowRoot!;
+      readerView.setAppendStatus('loading', '加载异常 (请求超时)，正在第 1/2 次自动重试…');
+      expect(shadow.querySelector('#rv-tail-status')!.textContent).toContain('第 1/2 次自动重试');
+
+      readerView.setAppendStatus('error', '同源 fetch 与 GM 通道均返回 HTTP 403');
+      const retryBtn = shadow.querySelector('#rv-footer-retry') as HTMLButtonElement;
+      expect(retryBtn.style.display).toBe('block');
+      retryBtn.click();
+      expect(onRetryAppendNext).toHaveBeenCalledTimes(1);
+
+      readerView.close();
+      expect(document.documentElement.classList.contains('novel-tts-reader-active')).toBe(false);
+      expect(scrollToSpy).toHaveBeenCalledWith(0, 320);
+    } finally {
+      if (origScrollYDesc) {
+        Object.defineProperty(window, 'scrollY', origScrollYDesc);
+      } else {
+        delete (window as any).scrollY;
+      }
+    }
+  });
 });

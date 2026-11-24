@@ -418,8 +418,14 @@ export function extractChapterContent(doc: Document, currentUrl?: string): Chapt
     });
     const parsed = reader.parse();
 
-    if (parsed && parsed.textContent) {
-      paragraphs = cleanParagraphs(parsed.textContent);
+    if (parsed && (parsed.content || parsed.textContent)) {
+      if (parsed.content && typeof DOMParser !== 'undefined') {
+        const parsedDoc = new DOMParser().parseFromString(parsed.content, 'text/html');
+        paragraphs = extractParagraphsFromElement(parsedDoc.body);
+      }
+      if (paragraphs.length === 0 && parsed.textContent) {
+        paragraphs = cleanParagraphs(parsed.textContent);
+      }
       title = cleanTitle(parsed.title || '');
     }
   } catch {
@@ -468,4 +474,58 @@ export function extractChapterContent(doc: Document, currentUrl?: string): Chapt
     prevChapterUrl,
     tocUrl,
   };
+}
+
+const DEDICATED_NOVEL_SELECTORS =
+  '#chaptercontent, #BookText, #txtContent, #novelcontent, #chapter-content, .chapter-content, .read-content';
+const CHAPTER_HEADING_REGEX =
+  /第[一二三四五六七八九十百千万零两\d]+\s*[章节回话卷节集]|^(?:序[章言幕]?|楔子|引子|尾声|番外|后记|chapter\s*\d+)/i;
+const ROOT_INDEX_PATH_REGEX = /^\/(?:index|default)\.(?:html?|php|aspx?|jsp)$/i;
+
+/**
+ * 判断当前页面是否为真正的小说章节阅读页（用于“自动进入阅读模式”防误触）
+ */
+export function isLikelyNovelChapterPage(
+  doc: Document,
+  chapter: ChapterContent,
+  currentUrl?: string
+): boolean {
+  if (!chapter || chapter.paragraphs.length < 3 || countEffectiveChars(chapter.paragraphs) < 400) {
+    return false;
+  }
+
+  const rawUrl = currentUrl || doc.baseURI || '';
+  if (rawUrl) {
+    try {
+      const parsed = new URL(rawUrl);
+      if (
+        parsed.pathname === '/' ||
+        parsed.pathname === '' ||
+        ROOT_INDEX_PATH_REGEX.test(parsed.pathname)
+      ) {
+        return false;
+      }
+    } catch {
+      // 忽略无效 URL 解析
+    }
+  }
+
+  const containerEl = doc.querySelector(DEDICATED_NOVEL_SELECTORS);
+  const containerChars = containerEl
+    ? (containerEl.textContent || '').replace(/\s+/g, '').length
+    : 0;
+  const hasDedicatedContainer = containerChars >= 100;
+  const hasNext = Boolean(chapter.nextChapterUrl);
+  const hasPrev = Boolean(chapter.prevChapterUrl);
+  const hasToc = Boolean(chapter.tocUrl);
+  const hasChapterTitle = CHAPTER_HEADING_REGEX.test(chapter.title || '');
+
+  const score =
+    (hasDedicatedContainer ? 1 : 0) +
+    (hasNext ? 1 : 0) +
+    (hasPrev ? 1 : 0) +
+    (hasToc ? 1 : 0) +
+    (hasChapterTitle ? 1 : 0);
+
+  return score >= 2 && (hasPrev || hasNext || hasToc || hasDedicatedContainer);
 }

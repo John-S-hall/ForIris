@@ -267,5 +267,89 @@ describe('chapterLoader.ts - 静默下一章加载与编码探测', () => {
       expect(toc.items[0].title).toBe('第一章');
       expect(loader.hasVisited(tocUrl)).toBe(false);
     });
+
+    it('https 页面遇到同域名 http:// 下一章链接时自动升级为 https:// 并走同源 fetch', async () => {
+      const origLocationDescriptor = Object.getOwnPropertyDescriptor(window, 'location');
+      try {
+        Object.defineProperty(window, 'location', {
+          value: new URL('https://novel.example.com/book/1.html'),
+          configurable: true,
+        });
+
+        const buffer = new TextEncoder().encode(chapterHtml).buffer;
+        window.fetch = vi.fn().mockResolvedValue({
+          ok: true,
+          status: 200,
+          headers: new Headers({ 'content-type': 'text/html; charset=utf-8' }),
+          arrayBuffer: async () => buffer,
+        } as any);
+
+        const loader = new ChapterLoader('https://novel.example.com/book/1.html');
+        const result = await loader.loadChapter('http://novel.example.com/book/2.html');
+
+        expect(result).not.toBeNull();
+        expect(window.fetch).toHaveBeenCalledTimes(1);
+        expect((window.fetch as any).mock.calls[0][0]).toBe(
+          'https://novel.example.com/book/2.html'
+        );
+      } finally {
+        if (origLocationDescriptor) {
+          Object.defineProperty(window, 'location', origLocationDescriptor);
+        }
+      }
+    });
+
+    it('瞬态错误 (HTTP 502 / 超时) 自动退避重试并触发 onRetry 回调，HTTP 403 硬拦截不重试且细分通道报错', async () => {
+      const buffer = new TextEncoder().encode(chapterHtml).buffer;
+      const currentOrigin = window.location.origin;
+
+      // 1. 连续两次 502 后第 3 次成功
+      let callCount = 0;
+      window.fetch = vi.fn().mockImplementation(async () => {
+        callCount++;
+        if (callCount <= 2) {
+          return { ok: false, status: 502 } as any;
+        }
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ 'content-type': 'text/html; charset=utf-8' }),
+          arrayBuffer: async () => buffer,
+        } as any;
+      });
+
+      const retries: Array<{ attempt: number; max: number; reason: string }> = [];
+      const loader = new ChapterLoader(`${currentOrigin}/book/101/chapter_1.html`);
+      const res = await loader.loadChapter(`${currentOrigin}/book/101/chapter_2.html`, {
+        retries: 2,
+        retryDelayMs: 5,
+        onRetry: (attempt, max, reason) => retries.push({ attempt, max, reason }),
+      });
+
+      expect(res).not.toBeNull();
+      expect(callCount).toBe(3);
+      expect(retries.length).toBe(2);
+      expect(retries[0].attempt).toBe(1);
+      expect(retries[0].max).toBe(2);
+      expect(retries[0].reason).toContain('HTTP 502');
+
+      // 2. HTTP 403 不重试，且双通道均 403 时合并清晰报错
+      window.fetch = vi.fn().mockResolvedValue({ ok: false, status: 403 } as any);
+      (globalThis as any).GM_xmlhttpRequest = vi.fn().mockImplementation((cfg) => {
+        setTimeout(() => cfg.onload({ status: 403 }), 0);
+        return { abort: vi.fn() };
+      });
+      const retrySpy403 = vi.fn();
+      await expect(
+        loader.loadChapter(`${currentOrigin}/book/101/chapter_403.html`, {
+          retries: 2,
+          retryDelayMs: 5,
+          onRetry: retrySpy403,
+        })
+      ).rejects.toThrow('同源 fetch 与 GM 通道均返回 HTTP 403（站点防火墙拦截后台抓取）');
+
+      expect(retrySpy403).not.toHaveBeenCalled();
+      expect(window.fetch).toHaveBeenCalledTimes(1);
+    });
   });
 });

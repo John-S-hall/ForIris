@@ -5,6 +5,7 @@ import {
   extractNextChapterUrl,
   extractPrevChapterUrl,
   findContentElement,
+  isLikelyNovelChapterPage,
   cleanLine,
 } from '../src/core/extractor';
 
@@ -230,5 +231,94 @@ describe('extractor.ts - 正文与下一章链接提取引擎', () => {
     const dom = new JSDOM(html, { url: 'https://example.com/1.html' });
     const el = findContentElement(dom.window.document);
     expect(el?.id).toBe('chaptercontent');
+  });
+
+  it('isLikelyNovelChapterPage：精准区分小说章节页与普通长文章、分页新闻、网站首页及短简介页', () => {
+    const longParagraphs = [
+      '晨曦初露时分，群山连绵的轮廓逐渐从浓重如墨的夜色与漫天白雾之中缓慢浮现出来，微风拂过林海，掀起一阵接一阵清脆而遥远的松涛沙沙声响。',
+      '陈平安独自一人背着那只略显陈旧的竹编背篓沿着蜿蜒陡峭的山道缓步下行，腰间悬着的那块无名铁牌在清晨凉爽湿润的空气中泛着淡淡的冷冽幽光。',
+      '远方山脚下的小镇早已经升起了袅袅炊烟，青砖黛瓦之间隐约可见三三两两赶早集的乡民与驮着木炭山货缓缓行进的骡马队伍，处处显得平静而祥和。',
+      '石桥边那株生长了不知多少百年的老槐树依然枝繁叶茂，粗壮苍老的树干上刻着几道早已被岁月磨平棱角的模糊剑痕，静静诉说着过往江湖里的恩怨情仇。',
+      '少年在桥头停下脚步，伸手从竹篓边缘取出一只略带磕碰的粗瓷水囊喝了两口微凉的清泉水，随后抬头望向远方云雾缭绕的青翠峰峦，眸光显得格外平静坚定。',
+      '他心里非常清楚，今天离开这座偏僻宁静的小镇之后，前方等待着自己的将会是一段漫长而又未知的修行征途，再也没有人能够在风雨来袭时替自己遮风挡雨了。',
+    ];
+
+    // 1. 典型小说章节页（>400字 + #chaptercontent + 章节标题 + 下一章 + 目录）-> true
+    const novelHtml = `
+      <!DOCTYPE html>
+      <html>
+        <body>
+          <h1>第三章 山镇清晨</h1>
+          <div id="chaptercontent">${longParagraphs.map((p) => `<p>${p}</p>`).join('')}</div>
+          <a href="/book/1/list.html">目录</a>
+          <a href="/book/1/4.html">下一章</a>
+        </body>
+      </html>
+    `;
+    const novelUrl = 'https://novel.example.com/book/1/3.html';
+    const novelDom = new JSDOM(novelHtml, { url: novelUrl });
+    const novelContent = extractChapterContent(novelDom.window.document, novelUrl);
+    expect(isLikelyNovelChapterPage(novelDom.window.document, novelContent, novelUrl)).toBe(true);
+
+    // 2. 普通长文新闻/博客（>400字，但无小说容器/目录/章回链接）-> false
+    const blogHtml = `
+      <!DOCTYPE html>
+      <html>
+        <body>
+          <article>
+            <h1>2026年深度前端架构演进观察与总结</h1>
+            ${longParagraphs.map((p) => `<p>${p}</p>`).join('')}
+          </article>
+        </body>
+      </html>
+    `;
+    const blogUrl = 'https://blog.example.com/posts/architecture-notes';
+    const blogDom = new JSDOM(blogHtml, { url: blogUrl });
+    const blogContent = extractChapterContent(blogDom.window.document, blogUrl);
+    expect(isLikelyNovelChapterPage(blogDom.window.document, blogContent, blogUrl)).toBe(false);
+
+    // 3. 仅带“下一页”的普通分页新闻 -> false (得分只有 1)
+    const pagedNewsHtml = `
+      <!DOCTYPE html>
+      <html>
+        <body>
+          <article>
+            <h1>城市建设年度报告</h1>
+            ${longParagraphs.map((p) => `<p>${p}</p>`).join('')}
+          </article>
+          <a href="/news/page_2.html">下一页</a>
+        </body>
+      </html>
+    `;
+    const pagedUrl = 'https://news.example.com/news/page_1.html';
+    const pagedDom = new JSDOM(pagedNewsHtml, { url: pagedUrl });
+    const pagedContent = extractChapterContent(pagedDom.window.document, pagedUrl);
+    expect(isLikelyNovelChapterPage(pagedDom.window.document, pagedContent, pagedUrl)).toBe(false);
+
+    // 4. 站点首页 / 或 /index.html -> false
+    expect(
+      isLikelyNovelChapterPage(
+        novelDom.window.document,
+        novelContent,
+        'https://novel.example.com/'
+      )
+    ).toBe(false);
+    expect(
+      isLikelyNovelChapterPage(
+        novelDom.window.document,
+        novelContent,
+        'https://novel.example.com/index.html'
+      )
+    ).toBe(false);
+
+    // 5. 短正文简介页 (< 400 字) -> false
+    const shortChapter = {
+      title: '第一章 简介',
+      paragraphs: ['这是第一段简短内容。', '这是第二段简短内容。', '这是第三段简短内容。'],
+      nextChapterUrl: 'https://novel.example.com/book/1/2.html',
+      prevChapterUrl: null,
+      tocUrl: 'https://novel.example.com/book/1/',
+    };
+    expect(isLikelyNovelChapterPage(novelDom.window.document, shortChapter, novelUrl)).toBe(false);
   });
 });

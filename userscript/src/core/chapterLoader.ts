@@ -2,6 +2,38 @@ import { extractChapterContent } from './extractor';
 import { extractTocFromDocument } from './tocExtractor';
 import type { ChapterContent, TocData } from './tts/types';
 
+export interface ChapterFetchOptions {
+  allowVisited?: boolean;
+  retries?: number;
+  retryDelayMs?: number;
+  onRetry?: (attempt: number, maxRetries: number, reason: string) => void;
+}
+
+export function describeHttpStatus(status: number): string {
+  if (status === 403) return 'HTTP 403（站点反爬拦截）';
+  if (status === 404) return 'HTTP 404（章节不存在）';
+  if (status === 429) return 'HTTP 429（请求过快限流）';
+  if (status >= 500) return `HTTP ${status}（源站服务异常）`;
+  return `HTTP ${status}`;
+}
+
+/**
+ * 判断抓取异常是否属于瞬态错误（仅对超时/网络异常/429/5xx 自动重试，绝不重复刷 403/404）
+ */
+export function isRetryableChapterError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err || '');
+  if (
+    /HTTP\s*(?:401|403|404|410)\b/i.test(msg) ||
+    msg.includes('非法的目录地址') ||
+    msg.includes('GM_xmlhttpRequest 在当前环境中不可用')
+  ) {
+    return false;
+  }
+  return /超时|网络错误|Failed to fetch|NetworkError|HTTP\s*429\b|HTTP\s*5\d\d\b|空响应|空内容/i.test(
+    msg
+  );
+}
+
 /**
  * 探测 HTML ArrayBuffer 的字符编码（支持 UTF-8 / GBK / GB2312 / GB18030）
  */
@@ -171,7 +203,7 @@ export class ChapterLoader {
       const res = await window.fetch(targetUrl, fetchInit);
 
       if (!res.ok) {
-        throw new Error(`同源 fetch 失败, HTTP ${res.status}`);
+        throw new Error(`同源 fetch 失败, ${describeHttpStatus(res.status)}`);
       }
 
       const buffer = await res.arrayBuffer();
@@ -262,7 +294,7 @@ export class ChapterLoader {
           timeout: 10000,
           onload: async (resp) => {
             if (resp.status < 200 || resp.status >= 300) {
-              finishError(new Error(`抓取下一章失败, HTTP ${resp.status}`));
+              finishError(new Error(`GM 通道抓取失败, ${describeHttpStatus(resp.status)}`));
               return;
             }
 
@@ -289,39 +321,90 @@ export class ChapterLoader {
     });
   }
 
-  private async fetchHtml(targetUrl: string): Promise<string> {
-    let html: string | null = null;
+  /**
+   * 当当前页为 https 且目标链接与当前页同域名但写成了 http 时，自动升级协议以保留同源 fetch 与 Cookie
+   */
+  private upgradeSameHostProtocol(targetUrl: string): string {
+    try {
+      if (typeof window === 'undefined' || !window.location) return targetUrl;
+      if (window.location.protocol !== 'https:') return targetUrl;
+      const parsed = new URL(targetUrl);
+      if (parsed.protocol === 'http:' && parsed.hostname === window.location.hostname) {
+        parsed.protocol = 'https:';
+        return parsed.href;
+      }
+    } catch {
+      // ignore invalid URL
+    }
+    return targetUrl;
+  }
+
+  private async fetchHtmlSingleAttempt(targetUrl: string): Promise<string> {
     let nativeFetchError: Error | null = null;
+    const sameOrigin = this.isSameOrigin(targetUrl);
 
     // 1. 若同源，优先使用原生 fetch（保留完整 Cookie 和防爬验证）
-    if (this.isSameOrigin(targetUrl) && typeof window.fetch === 'function') {
+    if (sameOrigin && typeof window.fetch === 'function') {
       try {
-        html = await this.fetchChapterViaNativeFetch(targetUrl);
+        return await this.fetchChapterViaNativeFetch(targetUrl);
       } catch (fetchErr: any) {
         nativeFetchError = fetchErr instanceof Error ? fetchErr : new Error(String(fetchErr));
         console.warn('[NovelTTS] 同源 fetch 失败，回退至 GM_xmlhttpRequest:', fetchErr);
       }
     }
 
-    // 2. 跨域或同源 fetch 失败后，使用 GM_xmlhttpRequest
-    if (!html) {
-      if (nativeFetchError && typeof GM_xmlhttpRequest !== 'function') {
-        throw nativeFetchError;
-      }
-      html = await this.fetchChapterViaGM(targetUrl);
+    // 2. 非同源或同源 fetch 失败后，使用 GM_xmlhttpRequest
+    if (nativeFetchError && typeof GM_xmlhttpRequest !== 'function') {
+      throw nativeFetchError;
     }
 
-    return html;
+    try {
+      return await this.fetchChapterViaGM(targetUrl);
+    } catch (gmErr: any) {
+      const gmMsg = gmErr instanceof Error ? gmErr.message : String(gmErr);
+      if (nativeFetchError) {
+        const fetchMsg = nativeFetchError.message;
+        if (/HTTP\s*403\b/i.test(fetchMsg) && /HTTP\s*403\b/i.test(gmMsg)) {
+          throw new Error('同源 fetch 与 GM 通道均返回 HTTP 403（站点防火墙拦截后台抓取）');
+        }
+        throw new Error(`同源 fetch 失败 (${fetchMsg})；GM 兜底失败 (${gmMsg})`);
+      }
+      throw new Error(`非同源链接，${gmMsg}`);
+    }
+  }
+
+  private async fetchHtml(
+    targetUrl: string,
+    options?: Omit<ChapterFetchOptions, 'allowVisited'>
+  ): Promise<string> {
+    const maxRetries = Math.max(0, options?.retries ?? 0);
+    const baseDelay = options?.retryDelayMs ?? 800;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await this.fetchHtmlSingleAttempt(targetUrl);
+      } catch (err) {
+        if (attempt >= maxRetries || !isRetryableChapterError(err)) {
+          throw err;
+        }
+        const reason = err instanceof Error ? err.message : String(err);
+        const nextAttempt = attempt + 1;
+        options?.onRetry?.(nextAttempt, maxRetries, reason);
+        await new Promise((resolve) => setTimeout(resolve, baseDelay * nextAttempt));
+      }
+    }
+
+    throw new Error('章节抓取失败');
   }
 
   /**
    * 静默拉取指定章节的 HTML 并解析正文
    * @param targetUrl 下一章完整 URL
-   * @param options 加载选项（allowVisited 为 true 时允许重读已访问章节，如手动上一章）
+   * @param options 加载选项（allowVisited 为 true 时允许重读已访问章节，支持瞬态失败自动退避重试）
    */
   async loadChapter(
     targetUrl: string,
-    options?: { allowVisited?: boolean }
+    options?: ChapterFetchOptions
   ): Promise<ChapterContent | null> {
     const normalized = this.normalizeUrl(targetUrl);
     if (!normalized) {
@@ -329,23 +412,30 @@ export class ChapterLoader {
       return null;
     }
 
+    const effectiveUrl = this.upgradeSameHostProtocol(targetUrl);
+    const effectiveNormalized = this.normalizeUrl(effectiveUrl) || normalized;
+
     // 防死循环判断（自动连播始终拦截，手动翻页可传 allowVisited 放行）
-    if (!options?.allowVisited && this.visitedUrls.has(normalized)) {
-      console.warn('[NovelTTS] Prevented loop: already visited URL:', normalized);
+    if (
+      !options?.allowVisited &&
+      (this.visitedUrls.has(normalized) || this.visitedUrls.has(effectiveNormalized))
+    ) {
+      console.warn('[NovelTTS] Prevented loop: already visited URL:', effectiveNormalized);
       return null;
     }
 
-    const html = await this.fetchHtml(targetUrl);
+    const html = await this.fetchHtml(effectiveUrl, options);
 
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, 'text/html');
 
     // 提取正文与新的下一章链接
-    const content = extractChapterContent(doc, targetUrl);
+    const content = extractChapterContent(doc, effectiveUrl);
 
     // 仅在提取到有效正文时才记录已访问，避免防爬挑战空页污染 visitedUrls
     if (content.paragraphs.length > 0) {
       this.visitedUrls.add(normalized);
+      this.visitedUrls.add(effectiveNormalized);
     }
 
     return content;
@@ -354,15 +444,19 @@ export class ChapterLoader {
   /**
    * 静默拉取小说目录页并解析章节列表（不写入 visitedUrls，避免污染正文防环）
    */
-  async loadToc(tocUrl: string): Promise<TocData> {
+  async loadToc(
+    tocUrl: string,
+    options?: Omit<ChapterFetchOptions, 'allowVisited'>
+  ): Promise<TocData> {
     const normalized = this.normalizeUrl(tocUrl);
     if (!normalized) {
       throw new Error(`非法的目录地址: ${tocUrl}`);
     }
 
-    const html = await this.fetchHtml(tocUrl);
+    const effectiveUrl = this.upgradeSameHostProtocol(tocUrl);
+    const html = await this.fetchHtml(effectiveUrl, options);
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, 'text/html');
-    return extractTocFromDocument(doc, tocUrl);
+    return extractTocFromDocument(doc, effectiveUrl);
   }
 }

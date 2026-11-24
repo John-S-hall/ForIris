@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelTTS-Userscript
 // @namespace    https://github.com/John-S-hall/ForIris
-// @version      0.4.0
+// @version      0.4.1
 // @author       John-S-hall
 // @description  移动端网页小说听书油猴脚本
 // @match        *://*/*
@@ -2356,8 +2356,14 @@
         charThreshold: 20
       });
       const parsed = reader.parse();
-      if (parsed && parsed.textContent) {
-        paragraphs = cleanParagraphs(parsed.textContent);
+      if (parsed && (parsed.content || parsed.textContent)) {
+        if (parsed.content && typeof DOMParser !== "undefined") {
+          const parsedDoc = new DOMParser().parseFromString(parsed.content, "text/html");
+          paragraphs = extractParagraphsFromElement(parsedDoc.body);
+        }
+        if (paragraphs.length === 0 && parsed.textContent) {
+          paragraphs = cleanParagraphs(parsed.textContent);
+        }
         title = cleanTitle(parsed.title || "");
       }
     } catch {
@@ -2393,6 +2399,33 @@
       prevChapterUrl,
       tocUrl
     };
+  }
+  const DEDICATED_NOVEL_SELECTORS = "#chaptercontent, #BookText, #txtContent, #novelcontent, #chapter-content, .chapter-content, .read-content";
+  const CHAPTER_HEADING_REGEX = /第[一二三四五六七八九十百千万零两\d]+\s*[章节回话卷节集]|^(?:序[章言幕]?|楔子|引子|尾声|番外|后记|chapter\s*\d+)/i;
+  const ROOT_INDEX_PATH_REGEX = /^\/(?:index|default)\.(?:html?|php|aspx?|jsp)$/i;
+  function isLikelyNovelChapterPage(doc, chapter, currentUrl) {
+    if (!chapter || chapter.paragraphs.length < 3 || countEffectiveChars$1(chapter.paragraphs) < 400) {
+      return false;
+    }
+    const rawUrl = currentUrl || doc.baseURI || "";
+    if (rawUrl) {
+      try {
+        const parsed = new URL(rawUrl);
+        if (parsed.pathname === "/" || parsed.pathname === "" || ROOT_INDEX_PATH_REGEX.test(parsed.pathname)) {
+          return false;
+        }
+      } catch {
+      }
+    }
+    const containerEl = doc.querySelector(DEDICATED_NOVEL_SELECTORS);
+    const containerChars = containerEl ? (containerEl.textContent || "").replace(/\s+/g, "").length : 0;
+    const hasDedicatedContainer = containerChars >= 100;
+    const hasNext = Boolean(chapter.nextChapterUrl);
+    const hasPrev = Boolean(chapter.prevChapterUrl);
+    const hasToc = Boolean(chapter.tocUrl);
+    const hasChapterTitle = CHAPTER_HEADING_REGEX.test(chapter.title || "");
+    const score = (hasDedicatedContainer ? 1 : 0) + (hasNext ? 1 : 0) + (hasPrev ? 1 : 0) + (hasToc ? 1 : 0) + (hasChapterTitle ? 1 : 0);
+    return score >= 2 && (hasPrev || hasNext || hasToc || hasDedicatedContainer);
   }
   const DEFAULT_MIN_CHARS = 30;
   const DEFAULT_MAX_CHARS = 120;
@@ -3334,6 +3367,22 @@
       });
     }
   }
+  function describeHttpStatus(status) {
+    if (status === 403) return "HTTP 403（站点反爬拦截）";
+    if (status === 404) return "HTTP 404（章节不存在）";
+    if (status === 429) return "HTTP 429（请求过快限流）";
+    if (status >= 500) return `HTTP ${status}（源站服务异常）`;
+    return `HTTP ${status}`;
+  }
+  function isRetryableChapterError(err) {
+    const msg = err instanceof Error ? err.message : String(err || "");
+    if (/HTTP\s*(?:401|403|404|410)\b/i.test(msg) || msg.includes("非法的目录地址") || msg.includes("GM_xmlhttpRequest 在当前环境中不可用")) {
+      return false;
+    }
+    return /超时|网络错误|Failed to fetch|NetworkError|HTTP\s*429\b|HTTP\s*5\d\d\b|空响应|空内容/i.test(
+      msg
+    );
+  }
   function detectCharset(headers, buffer) {
     let headerCharset = "";
     if (typeof headers === "string") {
@@ -3473,7 +3522,7 @@
         }
         const res = await window.fetch(targetUrl, fetchInit);
         if (!res.ok) {
-          throw new Error(`同源 fetch 失败, HTTP ${res.status}`);
+          throw new Error(`同源 fetch 失败, ${describeHttpStatus(res.status)}`);
         }
         const buffer = await res.arrayBuffer();
         if (!buffer || buffer.byteLength === 0) {
@@ -3554,7 +3603,7 @@
             timeout: 1e4,
             onload: async (resp) => {
               if (resp.status < 200 || resp.status >= 300) {
-                finishError(new Error(`抓取下一章失败, HTTP ${resp.status}`));
+                finishError(new Error(`GM 通道抓取失败, ${describeHttpStatus(resp.status)}`));
                 return;
               }
               try {
@@ -3579,29 +3628,73 @@
         }
       });
     }
-    async fetchHtml(targetUrl) {
-      let html = null;
+    /**
+     * 当当前页为 https 且目标链接与当前页同域名但写成了 http 时，自动升级协议以保留同源 fetch 与 Cookie
+     */
+    upgradeSameHostProtocol(targetUrl) {
+      try {
+        if (typeof window === "undefined" || !window.location) return targetUrl;
+        if (window.location.protocol !== "https:") return targetUrl;
+        const parsed = new URL(targetUrl);
+        if (parsed.protocol === "http:" && parsed.hostname === window.location.hostname) {
+          parsed.protocol = "https:";
+          return parsed.href;
+        }
+      } catch {
+      }
+      return targetUrl;
+    }
+    async fetchHtmlSingleAttempt(targetUrl) {
       let nativeFetchError = null;
-      if (this.isSameOrigin(targetUrl) && typeof window.fetch === "function") {
+      const sameOrigin = this.isSameOrigin(targetUrl);
+      if (sameOrigin && typeof window.fetch === "function") {
         try {
-          html = await this.fetchChapterViaNativeFetch(targetUrl);
+          return await this.fetchChapterViaNativeFetch(targetUrl);
         } catch (fetchErr) {
           nativeFetchError = fetchErr instanceof Error ? fetchErr : new Error(String(fetchErr));
           console.warn("[NovelTTS] 同源 fetch 失败，回退至 GM_xmlhttpRequest:", fetchErr);
         }
       }
-      if (!html) {
-        if (nativeFetchError && typeof GM_xmlhttpRequest !== "function") {
-          throw nativeFetchError;
-        }
-        html = await this.fetchChapterViaGM(targetUrl);
+      if (nativeFetchError && typeof GM_xmlhttpRequest !== "function") {
+        throw nativeFetchError;
       }
-      return html;
+      try {
+        return await this.fetchChapterViaGM(targetUrl);
+      } catch (gmErr) {
+        const gmMsg = gmErr instanceof Error ? gmErr.message : String(gmErr);
+        if (nativeFetchError) {
+          const fetchMsg = nativeFetchError.message;
+          if (/HTTP\s*403\b/i.test(fetchMsg) && /HTTP\s*403\b/i.test(gmMsg)) {
+            throw new Error("同源 fetch 与 GM 通道均返回 HTTP 403（站点防火墙拦截后台抓取）");
+          }
+          throw new Error(`同源 fetch 失败 (${fetchMsg})；GM 兜底失败 (${gmMsg})`);
+        }
+        throw new Error(`非同源链接，${gmMsg}`);
+      }
+    }
+    async fetchHtml(targetUrl, options) {
+      var _a;
+      const maxRetries = Math.max(0, (options == null ? void 0 : options.retries) ?? 0);
+      const baseDelay = (options == null ? void 0 : options.retryDelayMs) ?? 800;
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          return await this.fetchHtmlSingleAttempt(targetUrl);
+        } catch (err) {
+          if (attempt >= maxRetries || !isRetryableChapterError(err)) {
+            throw err;
+          }
+          const reason = err instanceof Error ? err.message : String(err);
+          const nextAttempt = attempt + 1;
+          (_a = options == null ? void 0 : options.onRetry) == null ? void 0 : _a.call(options, nextAttempt, maxRetries, reason);
+          await new Promise((resolve) => setTimeout(resolve, baseDelay * nextAttempt));
+        }
+      }
+      throw new Error("章节抓取失败");
     }
     /**
      * 静默拉取指定章节的 HTML 并解析正文
      * @param targetUrl 下一章完整 URL
-     * @param options 加载选项（allowVisited 为 true 时允许重读已访问章节，如手动上一章）
+     * @param options 加载选项（allowVisited 为 true 时允许重读已访问章节，支持瞬态失败自动退避重试）
      */
     async loadChapter(targetUrl, options) {
       const normalized = this.normalizeUrl(targetUrl);
@@ -3609,31 +3702,35 @@
         console.warn("[NovelTTS] Invalid chapter URL:", targetUrl);
         return null;
       }
-      if (!(options == null ? void 0 : options.allowVisited) && this.visitedUrls.has(normalized)) {
-        console.warn("[NovelTTS] Prevented loop: already visited URL:", normalized);
+      const effectiveUrl = this.upgradeSameHostProtocol(targetUrl);
+      const effectiveNormalized = this.normalizeUrl(effectiveUrl) || normalized;
+      if (!(options == null ? void 0 : options.allowVisited) && (this.visitedUrls.has(normalized) || this.visitedUrls.has(effectiveNormalized))) {
+        console.warn("[NovelTTS] Prevented loop: already visited URL:", effectiveNormalized);
         return null;
       }
-      const html = await this.fetchHtml(targetUrl);
+      const html = await this.fetchHtml(effectiveUrl, options);
       const parser = new DOMParser();
       const doc = parser.parseFromString(html, "text/html");
-      const content = extractChapterContent(doc, targetUrl);
+      const content = extractChapterContent(doc, effectiveUrl);
       if (content.paragraphs.length > 0) {
         this.visitedUrls.add(normalized);
+        this.visitedUrls.add(effectiveNormalized);
       }
       return content;
     }
     /**
      * 静默拉取小说目录页并解析章节列表（不写入 visitedUrls，避免污染正文防环）
      */
-    async loadToc(tocUrl) {
+    async loadToc(tocUrl, options) {
       const normalized = this.normalizeUrl(tocUrl);
       if (!normalized) {
         throw new Error(`非法的目录地址: ${tocUrl}`);
       }
-      const html = await this.fetchHtml(tocUrl);
+      const effectiveUrl = this.upgradeSameHostProtocol(tocUrl);
+      const html = await this.fetchHtml(effectiveUrl, options);
       const parser = new DOMParser();
       const doc = parser.parseFromString(html, "text/html");
-      return extractTocFromDocument(doc, tocUrl);
+      return extractTocFromDocument(doc, effectiveUrl);
     }
   }
   class WorkerHttpError extends Error {
@@ -5510,6 +5607,8 @@
   const USER_SCROLL_PROTECT_MS$1 = 4e3;
   const MAX_RENDERED_CHAPTERS = 5;
   const INFINITE_SCROLL_PRELOAD_PX = 700;
+  const ISOLATION_STYLE_ID = "novel-tts-reader-host-isolation";
+  const READER_ACTIVE_CLASS = "novel-tts-reader-active";
   const LINE_HEIGHT_PRESETS = [
     { value: 1.6, label: "紧凑" },
     { value: 1.85, label: "适中" },
@@ -5540,6 +5639,7 @@
       __publicField(this, "isChapterLoading", false);
       __publicField(this, "appendStatus", "idle");
       __publicField(this, "appendErrorMessage", "");
+      __publicField(this, "appendLoadingMessage", "");
       // 目录抽屉状态
       __publicField(this, "isTocOpen", false);
       __publicField(this, "tocSortDesc", false);
@@ -5549,9 +5649,12 @@
       __publicField(this, "opened", false);
       __publicField(this, "isMenuOpen", false);
       __publicField(this, "activeSubpanel", "none");
-      // 原网页滚动锁定备份
+      // 原网页滚动与样式隔离状态备份
+      __publicField(this, "hasSavedPageState", false);
       __publicField(this, "savedHtmlOverflow", null);
       __publicField(this, "savedBodyOverflow", null);
+      __publicField(this, "savedScrollX", 0);
+      __publicField(this, "savedScrollY", 0);
       // 手动滑动保护与双击识别
       __publicField(this, "lastUserScrollAt", 0);
       __publicField(this, "programmaticScrollUntil", 0);
@@ -5568,6 +5671,7 @@
       __publicField(this, "chaptersRootEl");
       __publicField(this, "tailStatusEl");
       __publicField(this, "footerPrevBtn");
+      __publicField(this, "footerRetryBtn");
       __publicField(this, "footerNextBtn");
       __publicField(this, "relocateBtn");
       __publicField(this, "miniBarEl");
@@ -5624,12 +5728,31 @@
     applyHostStyles() {
       this.host.style.setProperty("position", "fixed", "important");
       this.host.style.setProperty("inset", "0", "important");
-      this.host.style.setProperty("z-index", "2147483645", "important");
+      this.host.style.setProperty("z-index", "2147483646", "important");
       this.host.style.setProperty("display", "none", "important");
       this.host.style.setProperty("margin", "0", "important");
       this.host.style.setProperty("padding", "0", "important");
       this.host.style.setProperty("border", "0", "important");
       this.host.style.setProperty("background", "transparent", "important");
+    }
+    ensureHostIsolationStyle() {
+      if (typeof document === "undefined") return;
+      if (document.getElementById(ISOLATION_STYLE_ID)) return;
+      const target = document.head || document.documentElement;
+      if (!target) return;
+      const style = document.createElement("style");
+      style.id = ISOLATION_STYLE_ID;
+      style.textContent = `
+      html.${READER_ACTIVE_CLASS} {
+        overflow: hidden !important;
+      }
+      html.${READER_ACTIVE_CLASS} > *:not(head):not(#novel-tts-reader-root):not(#novel-tts-floating-root) {
+        display: none !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
+      }
+    `;
+      target.appendChild(style);
     }
     mount(parent) {
       const target = parent || document.documentElement || document.body;
@@ -5651,13 +5774,20 @@
       if (this.opened) return;
       this.opened = true;
       this.mount();
+      this.ensureHostIsolationStyle();
       if (typeof document !== "undefined") {
+        this.savedScrollX = typeof window !== "undefined" ? window.scrollX || 0 : 0;
+        this.savedScrollY = typeof window !== "undefined" ? window.scrollY || 0 : 0;
         this.savedHtmlOverflow = document.documentElement.style.overflow;
         document.documentElement.style.overflow = "hidden";
         if (document.body) {
           this.savedBodyOverflow = document.body.style.overflow;
           document.body.style.overflow = "hidden";
         }
+        if (this.host.parentNode === document.documentElement) {
+          document.documentElement.classList.add(READER_ACTIVE_CLASS);
+        }
+        this.hasSavedPageState = true;
       }
       this.host.style.setProperty("display", "block", "important");
       this.setMenuOpen(false);
@@ -5676,6 +5806,7 @@
     }
     restorePageOverflow() {
       if (typeof document === "undefined") return;
+      document.documentElement.classList.remove(READER_ACTIVE_CLASS);
       if (this.savedHtmlOverflow !== null) {
         document.documentElement.style.overflow = this.savedHtmlOverflow;
         this.savedHtmlOverflow = null;
@@ -5683,6 +5814,19 @@
       if (this.savedBodyOverflow !== null && document.body) {
         document.body.style.overflow = this.savedBodyOverflow;
         this.savedBodyOverflow = null;
+      }
+      if (this.hasSavedPageState) {
+        const targetX = this.savedScrollX;
+        const targetY = this.savedScrollY;
+        this.hasSavedPageState = false;
+        this.savedScrollX = 0;
+        this.savedScrollY = 0;
+        if (targetX !== 0 || targetY !== 0) {
+          try {
+            window.scrollTo(targetX, targetY);
+          } catch {
+          }
+        }
       }
     }
     clearSingleTapTimer() {
@@ -5805,9 +5949,10 @@
       this.chapterSectionMap.delete(removed.id);
       evictedOut.push(removed.id);
     }
-    setAppendStatus(status, errorMsg) {
+    setAppendStatus(status, message) {
       this.appendStatus = status;
-      this.appendErrorMessage = errorMsg || "";
+      this.appendErrorMessage = status === "error" ? message || "" : "";
+      this.appendLoadingMessage = status === "loading" ? message || "" : "";
       this.updateChapterControlsUI();
     }
     setChapterLoading(loading) {
@@ -5833,6 +5978,7 @@
       this.footerPrevBtn.disabled = this.isChapterLoading || !hasPrev;
       this.footerPrevBtn.style.display = this.settings.infiniteScroll ? "none" : "block";
       this.dockNextChBtn.disabled = this.isChapterLoading || !hasVisibleNext;
+      this.footerRetryBtn.style.display = "none";
       if (!hasTailNext || this.appendStatus === "end") {
         this.tailStatusEl.textContent = "已是最新章节";
         this.footerNextBtn.textContent = "已到末尾";
@@ -5840,13 +5986,15 @@
         return;
       }
       if (this.appendStatus === "loading" || this.isChapterLoading) {
-        this.tailStatusEl.textContent = "正在静默加载下一章…";
+        this.tailStatusEl.textContent = this.appendLoadingMessage || "正在静默加载下一章…";
         this.footerNextBtn.textContent = "加载中…";
         this.footerNextBtn.disabled = true;
         return;
       }
       if (this.appendStatus === "error") {
-        this.tailStatusEl.textContent = this.appendErrorMessage ? `自动加载受限 (${this.appendErrorMessage})` : "自动加载受限，可点击下方按钮跳转下一章";
+        this.tailStatusEl.textContent = this.appendErrorMessage ? `自动加载受限 (${this.appendErrorMessage})` : "自动加载受限，可重试或直接跳转下一章";
+        this.footerRetryBtn.style.display = "block";
+        this.footerRetryBtn.disabled = this.isChapterLoading;
         this.footerNextBtn.textContent = "直接跳转下一章";
         this.footerNextBtn.disabled = false;
         return;
@@ -6226,6 +6374,7 @@
             <div class="tail-status-text" id="rv-tail-status"></div>
             <div class="reader-footer-nav">
               <button class="footer-nav-btn" id="rv-footer-prev">上一章</button>
+              <button class="footer-nav-btn" id="rv-footer-retry" style="display:none">重试加载</button>
               <button class="footer-nav-btn primary" id="rv-footer-next">下一章</button>
             </div>
           </div>
@@ -6288,7 +6437,7 @@
             <span class="setting-label">启动</span>
             <label class="switch-label">
               <input type="checkbox" id="rv-auto-enter" />
-              <span>打开小说页自动进入阅读模式</span>
+              <span>进入小说章节页自动开启阅读模式</span>
             </label>
           </div>
         </div>
@@ -6372,6 +6521,7 @@
       this.chaptersRootEl = this.shadow.querySelector("#rv-chapters-root");
       this.tailStatusEl = this.shadow.querySelector("#rv-tail-status");
       this.footerPrevBtn = this.shadow.querySelector("#rv-footer-prev");
+      this.footerRetryBtn = this.shadow.querySelector("#rv-footer-retry");
       this.footerNextBtn = this.shadow.querySelector("#rv-footer-next");
       this.relocateBtn = this.shadow.querySelector("#rv-relocate");
       this.miniBarEl = this.shadow.querySelector("#rv-mini-bar");
@@ -6619,6 +6769,10 @@
       });
       this.topPrevBtn.addEventListener("click", () => this.events.onPrevChapter());
       this.footerPrevBtn.addEventListener("click", () => this.events.onPrevChapter());
+      this.footerRetryBtn.addEventListener("click", () => {
+        var _a, _b;
+        return (_b = (_a = this.events).onRetryAppendNext) == null ? void 0 : _b.call(_a);
+      });
       this.footerNextBtn.addEventListener("click", () => this.events.onNextChapter());
       this.dockTocBtn.addEventListener("click", () => {
         this.openTocDrawer();
@@ -6840,8 +6994,29 @@
       }
     }
   }
+  const READER_RESUME_KEY = "novel_tts_reader_resume_ts";
+  const READER_RESUME_TTL_MS = 12e4;
   function countEffectiveChars(paragraphs) {
     return paragraphs.reduce((sum, p) => sum + p.replace(/\s+/g, "").length, 0);
+  }
+  function markReaderResumeOnNextPage(isReaderOpen) {
+    if (!isReaderOpen || typeof sessionStorage === "undefined") return;
+    try {
+      sessionStorage.setItem(READER_RESUME_KEY, String(Date.now()));
+    } catch {
+    }
+  }
+  function consumeReaderResumeFlag() {
+    if (typeof sessionStorage === "undefined") return false;
+    try {
+      const raw = sessionStorage.getItem(READER_RESUME_KEY);
+      if (!raw) return false;
+      sessionStorage.removeItem(READER_RESUME_KEY);
+      const ts = Number.parseInt(raw, 10);
+      return Number.isFinite(ts) && Date.now() - ts >= 0 && Date.now() - ts <= READER_RESUME_TTL_MS;
+    } catch {
+      return false;
+    }
   }
   function initNovelTTS() {
     if (typeof window !== "undefined" && window.self !== window.top) {
@@ -7090,7 +7265,16 @@
       isAppendingNext = true;
       readerView.setAppendStatus("loading");
       try {
-        const loaded = await chapterLoader.loadChapter(nextUrl, { allowVisited: false });
+        const loaded = await chapterLoader.loadChapter(nextUrl, {
+          allowVisited: false,
+          retries: 2,
+          onRetry: (attempt, maxRetries, reason) => {
+            readerView.setAppendStatus(
+              "loading",
+              `加载异常 (${reason})，正在第 ${attempt}/${maxRetries} 次自动重试…`
+            );
+          }
+        });
         if (loaded === null) {
           readerView.setAppendStatus("end");
           return;
@@ -7222,7 +7406,11 @@
       bar.showToast(direction === "prev" ? "正在加载上一章…" : "正在加载下一章…");
       try {
         const loaded = await chapterLoader.loadChapter(targetUrl, {
-          allowVisited: options.isManual
+          allowVisited: options.isManual,
+          retries: options.isManual ? 1 : 2,
+          onRetry: (attempt, maxRetries, reason) => {
+            bar.showToast(`${reason}，正在第 ${attempt}/${maxRetries} 次自动重试…`);
+          }
         });
         if (!loaded || loaded.paragraphs.length === 0) {
           throw new Error("章节正文提取失败或已到达边界");
@@ -7251,6 +7439,7 @@
       } catch (err) {
         console.warn("[NovelTTS] Failed to load chapter silently:", err);
         if (options.isManual) {
+          markReaderResumeOnNextPage(readerView.isOpen());
           bar.showToast("静默加载受限，正在直接跳转章节…");
           setTimeout(() => {
             window.location.href = targetUrl;
@@ -7309,7 +7498,7 @@
         currentVisUrl
       );
       try {
-        const data = await chapterLoader.loadToc(tocUrl);
+        const data = await chapterLoader.loadToc(tocUrl, { retries: 1 });
         tocCache.set(tocUrl, data);
         readerView.setTocState(
           {
@@ -7358,7 +7547,7 @@
         currentVisUrl
       );
       try {
-        const moreData = await chapterLoader.loadToc(nextPageUrl);
+        const moreData = await chapterLoader.loadToc(nextPageUrl, { retries: 1 });
         const seen = new Set(cached.items.map((it) => it.url));
         for (const item of moreData.items) {
           if (!seen.has(item.url)) {
@@ -7422,7 +7611,13 @@
       bar.showToast(`正在加载：${title}…`);
       try {
         chapterLoader.resetVisited(targetUrl);
-        const loaded = await chapterLoader.loadChapter(targetUrl, { allowVisited: true });
+        const loaded = await chapterLoader.loadChapter(targetUrl, {
+          allowVisited: true,
+          retries: 1,
+          onRetry: (attempt, maxRetries, reason) => {
+            bar.showToast(`${reason}，正在第 ${attempt}/${maxRetries} 次自动重试…`);
+          }
+        });
         if (!loaded || loaded.paragraphs.length === 0) {
           throw new Error("未能提取到章节正文");
         }
@@ -7448,6 +7643,7 @@
         }
       } catch (err) {
         console.warn("[NovelTTS] Jump from TOC failed:", err);
+        markReaderResumeOnNextPage(readerView.isOpen());
         bar.showToast("目录跳章受限，正在打开章节原页…");
         setTimeout(() => {
           window.location.href = targetUrl;
@@ -7527,6 +7723,9 @@
       onRequestAppendNext: () => {
         void handleAppendNextChapter();
       },
+      onRetryAppendNext: () => {
+        void handleAppendNextChapter();
+      },
       onOpenToc: () => {
         void handleOpenToc(false);
       },
@@ -7560,11 +7759,25 @@
       onToast: (msg) => bar.showToast(msg)
     });
     const tryAutoEnterReader = () => {
-      if (!ConfigStorage.load().reader.autoEnter || readerView.isOpen()) {
+      if (readerView.isOpen()) {
+        return;
+      }
+      const resumed = consumeReaderResumeFlag();
+      const autoEnter = ConfigStorage.load().reader.autoEnter;
+      if (!resumed && !autoEnter) {
         return;
       }
       const item = ensureInitialChapterParsed(true);
-      if (item && item.chapter.paragraphs.length >= 2 && countEffectiveChars(item.chapter.paragraphs) >= 200) {
+      if (!item || item.chapter.paragraphs.length < 2) {
+        return;
+      }
+      if (resumed) {
+        if (countEffectiveChars(item.chapter.paragraphs) >= 100) {
+          openReader();
+        }
+        return;
+      }
+      if (isLikelyNovelChapterPage(document, item.chapter, window.location.href)) {
         openReader();
       }
     };

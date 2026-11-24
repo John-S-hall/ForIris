@@ -4,6 +4,7 @@ import {
   extractPrevChapterUrl,
   extractTocUrl,
   findContentElement,
+  isLikelyNovelChapterPage,
 } from './core/extractor';
 import { normalizeHttpUrl } from './core/tocExtractor';
 import { chunkParagraphs } from './core/chunker';
@@ -16,10 +17,35 @@ import { ReaderView, type LoadedReaderChapter } from './ui/readerView';
 import { PageHighlighter } from './ui/pageHighlighter';
 import type { ChapterContent, TocData, TocItem } from './core/tts/types';
 
-export const VERSION = '0.4.0';
+export const VERSION = '0.4.1';
+
+const READER_RESUME_KEY = 'novel_tts_reader_resume_ts';
+const READER_RESUME_TTL_MS = 120_000;
 
 function countEffectiveChars(paragraphs: string[]): number {
   return paragraphs.reduce((sum, p) => sum + p.replace(/\s+/g, '').length, 0);
+}
+
+function markReaderResumeOnNextPage(isReaderOpen: boolean): void {
+  if (!isReaderOpen || typeof sessionStorage === 'undefined') return;
+  try {
+    sessionStorage.setItem(READER_RESUME_KEY, String(Date.now()));
+  } catch {
+    // 隐私模式或受限环境静默忽略
+  }
+}
+
+function consumeReaderResumeFlag(): boolean {
+  if (typeof sessionStorage === 'undefined') return false;
+  try {
+    const raw = sessionStorage.getItem(READER_RESUME_KEY);
+    if (!raw) return false;
+    sessionStorage.removeItem(READER_RESUME_KEY);
+    const ts = Number.parseInt(raw, 10);
+    return Number.isFinite(ts) && Date.now() - ts >= 0 && Date.now() - ts <= READER_RESUME_TTL_MS;
+  } catch {
+    return false;
+  }
 }
 
 function initNovelTTS(): void {
@@ -336,7 +362,16 @@ function initNovelTTS(): void {
     readerView.setAppendStatus('loading');
 
     try {
-      const loaded = await chapterLoader.loadChapter(nextUrl, { allowVisited: false });
+      const loaded = await chapterLoader.loadChapter(nextUrl, {
+        allowVisited: false,
+        retries: 2,
+        onRetry: (attempt, maxRetries, reason) => {
+          readerView.setAppendStatus(
+            'loading',
+            `加载异常 (${reason})，正在第 ${attempt}/${maxRetries} 次自动重试…`
+          );
+        },
+      });
       if (loaded === null) {
         // 已在 visitedUrls 中（防环），停止继续自动向后拼接
         readerView.setAppendStatus('end');
@@ -501,6 +536,10 @@ function initNovelTTS(): void {
     try {
       const loaded = await chapterLoader.loadChapter(targetUrl, {
         allowVisited: options.isManual,
+        retries: options.isManual ? 1 : 2,
+        onRetry: (attempt, maxRetries, reason) => {
+          bar.showToast(`${reason}，正在第 ${attempt}/${maxRetries} 次自动重试…`);
+        },
       });
 
       if (!loaded || loaded.paragraphs.length === 0) {
@@ -534,6 +573,7 @@ function initNovelTTS(): void {
       console.warn('[NovelTTS] Failed to load chapter silently:', err);
 
       if (options.isManual) {
+        markReaderResumeOnNextPage(readerView.isOpen());
         bar.showToast('静默加载受限，正在直接跳转章节…');
         setTimeout(() => {
           window.location.href = targetUrl;
@@ -598,7 +638,7 @@ function initNovelTTS(): void {
     );
 
     try {
-      const data = await chapterLoader.loadToc(tocUrl);
+      const data = await chapterLoader.loadToc(tocUrl, { retries: 1 });
       tocCache.set(tocUrl, data);
       readerView.setTocState(
         {
@@ -650,7 +690,7 @@ function initNovelTTS(): void {
     );
 
     try {
-      const moreData = await chapterLoader.loadToc(nextPageUrl);
+      const moreData = await chapterLoader.loadToc(nextPageUrl, { retries: 1 });
       const seen = new Set(cached.items.map((it) => it.url));
       for (const item of moreData.items) {
         if (!seen.has(item.url)) {
@@ -721,7 +761,13 @@ function initNovelTTS(): void {
 
     try {
       chapterLoader.resetVisited(targetUrl);
-      const loaded = await chapterLoader.loadChapter(targetUrl, { allowVisited: true });
+      const loaded = await chapterLoader.loadChapter(targetUrl, {
+        allowVisited: true,
+        retries: 1,
+        onRetry: (attempt, maxRetries, reason) => {
+          bar.showToast(`${reason}，正在第 ${attempt}/${maxRetries} 次自动重试…`);
+        },
+      });
       if (!loaded || loaded.paragraphs.length === 0) {
         throw new Error('未能提取到章节正文');
       }
@@ -750,6 +796,7 @@ function initNovelTTS(): void {
       }
     } catch (err: any) {
       console.warn('[NovelTTS] Jump from TOC failed:', err);
+      markReaderResumeOnNextPage(readerView.isOpen());
       bar.showToast('目录跳章受限，正在打开章节原页…');
       setTimeout(() => {
         window.location.href = targetUrl;
@@ -838,6 +885,9 @@ function initNovelTTS(): void {
     onRequestAppendNext: () => {
       void handleAppendNextChapter();
     },
+    onRetryAppendNext: () => {
+      void handleAppendNextChapter();
+    },
     onOpenToc: () => {
       void handleOpenToc(false);
     },
@@ -871,17 +921,31 @@ function initNovelTTS(): void {
     onToast: (msg) => bar.showToast(msg),
   });
 
-  // 6. 挂载 UI 并检测自动进入阅读模式
+  // 6. 挂载 UI 并检测是否需要自动进入阅读模式
   const tryAutoEnterReader = () => {
-    if (!ConfigStorage.load().reader.autoEnter || readerView.isOpen()) {
+    if (readerView.isOpen()) {
       return;
     }
+
+    const resumed = consumeReaderResumeFlag();
+    const autoEnter = ConfigStorage.load().reader.autoEnter;
+    if (!resumed && !autoEnter) {
+      return;
+    }
+
     const item = ensureInitialChapterParsed(true);
-    if (
-      item &&
-      item.chapter.paragraphs.length >= 2 &&
-      countEffectiveChars(item.chapter.paragraphs) >= 200
-    ) {
+    if (!item || item.chapter.paragraphs.length < 2) {
+      return;
+    }
+
+    if (resumed) {
+      if (countEffectiveChars(item.chapter.paragraphs) >= 100) {
+        openReader();
+      }
+      return;
+    }
+
+    if (isLikelyNovelChapterPage(document, item.chapter, window.location.href)) {
       openReader();
     }
   };

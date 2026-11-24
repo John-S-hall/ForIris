@@ -42,6 +42,7 @@ export interface ReaderViewEvents {
   onPrevChapter: () => void;
   onNextChapter: () => void;
   onRequestAppendNext: () => void;
+  onRetryAppendNext?: () => void;
   onOpenToc: () => void;
   onRefreshToc: () => void;
   onLoadMoreToc: (nextPageUrl: string) => void;
@@ -62,6 +63,8 @@ type DockSubpanel = 'none' | 'appearance' | 'tts' | 'worker';
 const USER_SCROLL_PROTECT_MS = 4000;
 const MAX_RENDERED_CHAPTERS = 5;
 const INFINITE_SCROLL_PRELOAD_PX = 700;
+const ISOLATION_STYLE_ID = 'novel-tts-reader-host-isolation';
+const READER_ACTIVE_CLASS = 'novel-tts-reader-active';
 
 const LINE_HEIGHT_PRESETS: ReadonlyArray<{ value: number; label: string }> = [
   { value: 1.6, label: '紧凑' },
@@ -99,6 +102,7 @@ export class ReaderView {
   private isChapterLoading = false;
   private appendStatus: AppendStatus = 'idle';
   private appendErrorMessage = '';
+  private appendLoadingMessage = '';
 
   // 目录抽屉状态
   private isTocOpen = false;
@@ -111,9 +115,12 @@ export class ReaderView {
   private isMenuOpen = false;
   private activeSubpanel: DockSubpanel = 'none';
 
-  // 原网页滚动锁定备份
+  // 原网页滚动与样式隔离状态备份
+  private hasSavedPageState = false;
   private savedHtmlOverflow: string | null = null;
   private savedBodyOverflow: string | null = null;
+  private savedScrollX = 0;
+  private savedScrollY = 0;
 
   // 手动滑动保护与双击识别
   private lastUserScrollAt = 0;
@@ -132,6 +139,7 @@ export class ReaderView {
   private chaptersRootEl!: HTMLElement;
   private tailStatusEl!: HTMLElement;
   private footerPrevBtn!: HTMLButtonElement;
+  private footerRetryBtn!: HTMLButtonElement;
   private footerNextBtn!: HTMLButtonElement;
   private relocateBtn!: HTMLButtonElement;
 
@@ -200,12 +208,33 @@ export class ReaderView {
   private applyHostStyles(): void {
     this.host.style.setProperty('position', 'fixed', 'important');
     this.host.style.setProperty('inset', '0', 'important');
-    this.host.style.setProperty('z-index', '2147483645', 'important');
+    this.host.style.setProperty('z-index', '2147483646', 'important');
     this.host.style.setProperty('display', 'none', 'important');
     this.host.style.setProperty('margin', '0', 'important');
     this.host.style.setProperty('padding', '0', 'important');
     this.host.style.setProperty('border', '0', 'important');
     this.host.style.setProperty('background', 'transparent', 'important');
+  }
+
+  private ensureHostIsolationStyle(): void {
+    if (typeof document === 'undefined') return;
+    if (document.getElementById(ISOLATION_STYLE_ID)) return;
+    const target = document.head || document.documentElement;
+    if (!target) return;
+
+    const style = document.createElement('style');
+    style.id = ISOLATION_STYLE_ID;
+    style.textContent = `
+      html.${READER_ACTIVE_CLASS} {
+        overflow: hidden !important;
+      }
+      html.${READER_ACTIVE_CLASS} > *:not(head):not(#novel-tts-reader-root):not(#novel-tts-floating-root) {
+        display: none !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
+      }
+    `;
+    target.appendChild(style);
   }
 
   mount(parent?: HTMLElement): void {
@@ -231,14 +260,21 @@ export class ReaderView {
     if (this.opened) return;
     this.opened = true;
     this.mount();
+    this.ensureHostIsolationStyle();
 
     if (typeof document !== 'undefined') {
+      this.savedScrollX = typeof window !== 'undefined' ? window.scrollX || 0 : 0;
+      this.savedScrollY = typeof window !== 'undefined' ? window.scrollY || 0 : 0;
       this.savedHtmlOverflow = document.documentElement.style.overflow;
       document.documentElement.style.overflow = 'hidden';
       if (document.body) {
         this.savedBodyOverflow = document.body.style.overflow;
         document.body.style.overflow = 'hidden';
       }
+      if (this.host.parentNode === document.documentElement) {
+        document.documentElement.classList.add(READER_ACTIVE_CLASS);
+      }
+      this.hasSavedPageState = true;
     }
 
     this.host.style.setProperty('display', 'block', 'important');
@@ -260,6 +296,8 @@ export class ReaderView {
 
   private restorePageOverflow(): void {
     if (typeof document === 'undefined') return;
+    document.documentElement.classList.remove(READER_ACTIVE_CLASS);
+
     if (this.savedHtmlOverflow !== null) {
       document.documentElement.style.overflow = this.savedHtmlOverflow;
       this.savedHtmlOverflow = null;
@@ -267,6 +305,20 @@ export class ReaderView {
     if (this.savedBodyOverflow !== null && document.body) {
       document.body.style.overflow = this.savedBodyOverflow;
       this.savedBodyOverflow = null;
+    }
+    if (this.hasSavedPageState) {
+      const targetX = this.savedScrollX;
+      const targetY = this.savedScrollY;
+      this.hasSavedPageState = false;
+      this.savedScrollX = 0;
+      this.savedScrollY = 0;
+      if (targetX !== 0 || targetY !== 0) {
+        try {
+          window.scrollTo(targetX, targetY);
+        } catch {
+          // jsdom 忽略
+        }
+      }
     }
   }
 
@@ -413,9 +465,10 @@ export class ReaderView {
     evictedOut.push(removed.id);
   }
 
-  setAppendStatus(status: AppendStatus, errorMsg?: string): void {
+  setAppendStatus(status: AppendStatus, message?: string): void {
     this.appendStatus = status;
-    this.appendErrorMessage = errorMsg || '';
+    this.appendErrorMessage = status === 'error' ? message || '' : '';
+    this.appendLoadingMessage = status === 'loading' ? message || '' : '';
     this.updateChapterControlsUI();
   }
 
@@ -448,6 +501,8 @@ export class ReaderView {
     this.footerPrevBtn.style.display = this.settings.infiniteScroll ? 'none' : 'block';
     this.dockNextChBtn.disabled = this.isChapterLoading || !hasVisibleNext;
 
+    this.footerRetryBtn.style.display = 'none';
+
     if (!hasTailNext || this.appendStatus === 'end') {
       this.tailStatusEl.textContent = '已是最新章节';
       this.footerNextBtn.textContent = '已到末尾';
@@ -456,7 +511,7 @@ export class ReaderView {
     }
 
     if (this.appendStatus === 'loading' || this.isChapterLoading) {
-      this.tailStatusEl.textContent = '正在静默加载下一章…';
+      this.tailStatusEl.textContent = this.appendLoadingMessage || '正在静默加载下一章…';
       this.footerNextBtn.textContent = '加载中…';
       this.footerNextBtn.disabled = true;
       return;
@@ -465,7 +520,9 @@ export class ReaderView {
     if (this.appendStatus === 'error') {
       this.tailStatusEl.textContent = this.appendErrorMessage
         ? `自动加载受限 (${this.appendErrorMessage})`
-        : '自动加载受限，可点击下方按钮跳转下一章';
+        : '自动加载受限，可重试或直接跳转下一章';
+      this.footerRetryBtn.style.display = 'block';
+      this.footerRetryBtn.disabled = this.isChapterLoading;
       this.footerNextBtn.textContent = '直接跳转下一章';
       this.footerNextBtn.disabled = false;
       return;
@@ -935,6 +992,7 @@ export class ReaderView {
             <div class="tail-status-text" id="rv-tail-status"></div>
             <div class="reader-footer-nav">
               <button class="footer-nav-btn" id="rv-footer-prev">上一章</button>
+              <button class="footer-nav-btn" id="rv-footer-retry" style="display:none">重试加载</button>
               <button class="footer-nav-btn primary" id="rv-footer-next">下一章</button>
             </div>
           </div>
@@ -997,7 +1055,7 @@ export class ReaderView {
             <span class="setting-label">启动</span>
             <label class="switch-label">
               <input type="checkbox" id="rv-auto-enter" />
-              <span>打开小说页自动进入阅读模式</span>
+              <span>进入小说章节页自动开启阅读模式</span>
             </label>
           </div>
         </div>
@@ -1083,6 +1141,7 @@ export class ReaderView {
     this.chaptersRootEl = this.shadow.querySelector('#rv-chapters-root')!;
     this.tailStatusEl = this.shadow.querySelector('#rv-tail-status')!;
     this.footerPrevBtn = this.shadow.querySelector('#rv-footer-prev')!;
+    this.footerRetryBtn = this.shadow.querySelector('#rv-footer-retry')!;
     this.footerNextBtn = this.shadow.querySelector('#rv-footer-next')!;
     this.relocateBtn = this.shadow.querySelector('#rv-relocate')!;
 
@@ -1372,9 +1431,10 @@ export class ReaderView {
       });
     });
 
-    // 章首/章尾翻页
+    // 章首/章尾翻页与重试
     this.topPrevBtn.addEventListener('click', () => this.events.onPrevChapter());
     this.footerPrevBtn.addEventListener('click', () => this.events.onPrevChapter());
+    this.footerRetryBtn.addEventListener('click', () => this.events.onRetryAppendNext?.());
     this.footerNextBtn.addEventListener('click', () => this.events.onNextChapter());
 
     // 布局 2：仿夸克 4 键底栏
