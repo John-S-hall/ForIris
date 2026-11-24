@@ -2,19 +2,21 @@ import {
   extractChapterContent,
   extractNextChapterUrl,
   extractPrevChapterUrl,
+  extractTocUrl,
   findContentElement,
 } from './core/extractor';
-import { chunkParagraphs, type StructuredChunk } from './core/chunker';
+import { normalizeHttpUrl } from './core/tocExtractor';
+import { chunkParagraphs } from './core/chunker';
 import { NovelPlayer } from './core/player';
 import { ConfigStorage, type ReaderSettings } from './core/storage';
 import { ChapterLoader } from './core/chapterLoader';
 import { EdgeWorkerTTSProvider } from './core/tts/edgeWorker';
 import { FloatingBar } from './ui/floatingBar';
-import { ReaderView } from './ui/readerView';
+import { ReaderView, type LoadedReaderChapter } from './ui/readerView';
 import { PageHighlighter } from './ui/pageHighlighter';
-import type { ChapterContent } from './core/tts/types';
+import type { ChapterContent, TocData, TocItem } from './core/tts/types';
 
-export const VERSION = '0.3.0';
+export const VERSION = '0.4.0';
 
 function countEffectiveChars(paragraphs: string[]): number {
   return paragraphs.reduce((sum, p) => sum + p.replace(/\s+/g, '').length, 0);
@@ -39,12 +41,22 @@ function initNovelTTS(): void {
   const chapterLoader = new ChapterLoader(initialPageUrl);
   const pageHighlighter = new PageHighlighter();
 
-  let currentChapter: ChapterContent | null = null;
-  let currentChunks: StructuredChunk[] = [];
-  let currentChapterUrl = initialPageUrl;
+  const toChapterId = (url: string): string =>
+    normalizeHttpUrl(url, window.location.href) || url;
+
+  // 多章滑动窗口与目录状态
+  let loadedChapters: LoadedReaderChapter[] = [];
+  const readingHistory: TocItem[] = [];
+  let visibleChapterId: string | null = null;
+  let playingChapterId: string | null = null;
   let activeChunkIndex = -1;
   let lastSeenHref = initialPageUrl;
+
   let isChapterLoading = false;
+  let isAppendingNext = false;
+  let knownTocUrl: string | null = null;
+  const tocCache = new Map<string, TocData>();
+  let tocLoadingMore = false;
 
   let bar!: FloatingBar;
   let readerView!: ReaderView;
@@ -52,6 +64,46 @@ function initNovelTTS(): void {
   const isPlayerActive = (): boolean => {
     const state = player.getState();
     return state === 'playing' || state === 'loading' || state === 'paused';
+  };
+
+  const getVisibleChapter = (): LoadedReaderChapter | null =>
+    loadedChapters.find((c) => c.id === visibleChapterId) || loadedChapters[0] || null;
+
+  const getPlayingChapter = (): LoadedReaderChapter | null =>
+    loadedChapters.find((c) => c.id === playingChapterId) || getVisibleChapter();
+
+  const recordHistory = (url: string, title: string) => {
+    const id = toChapterId(url);
+    if (!readingHistory.some((item) => item.url === id)) {
+      readingHistory.push({
+        title: title || id,
+        url: id,
+      });
+    }
+  };
+
+  const makeLoadedChapter = (url: string, chapter: ChapterContent): LoadedReaderChapter => {
+    const id = toChapterId(url);
+    if (chapter.tocUrl) {
+      knownTocUrl = chapter.tocUrl;
+    }
+    recordHistory(url, chapter.title);
+    return {
+      id,
+      url,
+      chapter,
+      chunks: chunkParagraphs(chapter.paragraphs),
+    };
+  };
+
+  const syncBrowserUrlAndTitle = (targetUrl: string, title: string) => {
+    try {
+      window.history.replaceState(null, '', targetUrl);
+      document.title = title;
+    } catch {
+      // 跨域或沙箱环境静默忽略
+    }
+    lastSeenHref = window.location.href;
   };
 
   // 4. 初始化播放器
@@ -66,16 +118,17 @@ function initNovelTTS(): void {
         if (state === 'idle' && !isChapterLoading) {
           activeChunkIndex = -1;
           pageHighlighter.clear();
-          readerView.setActiveChunk(-1);
+          readerView.setActiveChunk(null, -1);
         }
       },
       onIndexChange: (idx, total, text) => {
         activeChunkIndex = idx;
         bar.updateProgress(idx, total, text);
         readerView.updateProgress(idx, total);
-        readerView.setActiveChunk(idx);
+        readerView.setActiveChunk(playingChapterId, idx);
 
-        if (!readerView.isOpen() && currentChapterUrl === initialPageUrl) {
+        const playing = getPlayingChapter();
+        if (!readerView.isOpen() && playing?.url === initialPageUrl) {
           pageHighlighter.highlight(text);
         }
       },
@@ -83,15 +136,15 @@ function initNovelTTS(): void {
         bar.showToast(msg);
       },
       onChapterEnd: () => {
-        void handleLoadChapter('next', { isManual: false, autoPlay: true });
+        void handleChapterEnd();
       },
     },
   });
 
-  // 按需解析当前页正文（页面未变更且已解析时直接复用，避免重复提取）
-  const ensureCurrentChapterParsed = (silent = false): ChapterContent | null => {
+  // 按需解析当前页正文
+  const ensureInitialChapterParsed = (silent = false): LoadedReaderChapter | null => {
     const href = window.location.href;
-    if (!currentChapter || currentChapter.paragraphs.length === 0 || lastSeenHref !== href) {
+    if (loadedChapters.length === 0 || lastSeenHref !== href) {
       if (!silent) {
         bar.showToast('正在解析小说正文…');
       }
@@ -99,40 +152,50 @@ function initNovelTTS(): void {
       lastSeenHref = href;
 
       if (!extracted || extracted.paragraphs.length === 0) {
-        currentChapter = null;
-        currentChunks = [];
+        loadedChapters = [];
+        visibleChapterId = null;
         return null;
       }
 
-      currentChapter = extracted;
-      currentChapterUrl = href;
-      currentChunks = chunkParagraphs(extracted.paragraphs);
+      const item = makeLoadedChapter(href, extracted);
+      loadedChapters = [item];
+      visibleChapterId = item.id;
       chapterLoader.markVisited(href);
       pageHighlighter.setContainer(findContentElement(document));
       bar.updateChapter(extracted.title);
+
+      if (readerView.isOpen()) {
+        readerView.replaceChapter(item);
+      }
     }
-    return currentChapter;
+    return getVisibleChapter();
   };
 
   // 打开 / 关闭阅读模式
   const openReader = (): void => {
-    const chapter = ensureCurrentChapterParsed(true);
-    if (!chapter || currentChunks.length === 0) {
+    const current = ensureInitialChapterParsed(true);
+    if (!current || current.chunks.length === 0) {
       bar.showToast('未识别到小说正文，无法开启阅读模式');
       return;
     }
 
     pageHighlighter.clear();
-    const isCrossChapter = currentChapterUrl !== initialPageUrl;
-    readerView.renderChapter(
-      chapter,
-      currentChunks,
-      isCrossChapter ? currentChapterUrl : undefined
-    );
+    if (!readerView.isOpen()) {
+      // 若此前已有其他加载态未在 ReaderView 中同步，以当前 loadedChapters 重建
+      readerView.replaceChapter(loadedChapters[0]);
+      for (let i = 1; i < loadedChapters.length; i++) {
+        readerView.appendChapter(loadedChapters[i]);
+      }
+      if (visibleChapterId && visibleChapterId !== loadedChapters[0].id) {
+        readerView.scrollToChapter(visibleChapterId);
+      }
+    }
+
+    const activeOrVisible = getPlayingChapter() || current;
     readerView.updatePlayerState(player.getState());
     readerView.updateProgress(
       activeChunkIndex >= 0 ? activeChunkIndex : -1,
-      currentChunks.length
+      activeOrVisible.chunks.length
     );
 
     const latestCfg = ConfigStorage.load();
@@ -144,8 +207,8 @@ function initNovelTTS(): void {
     bar.setSuppressed(true);
     readerView.open();
 
-    if (activeChunkIndex >= 0 && isPlayerActive()) {
-      readerView.setActiveChunk(activeChunkIndex);
+    if (activeChunkIndex >= 0 && isPlayerActive() && playingChapterId) {
+      readerView.setActiveChunk(playingChapterId, activeChunkIndex);
     }
   };
 
@@ -153,7 +216,8 @@ function initNovelTTS(): void {
     readerView.close();
     bar.setSuppressed(false);
 
-    if (isPlayerActive() && activeChunkIndex >= 0 && currentChapterUrl === initialPageUrl) {
+    const playing = getPlayingChapter();
+    if (isPlayerActive() && activeChunkIndex >= 0 && playing?.url === initialPageUrl) {
       const sentence = player.getSentences()[activeChunkIndex];
       if (sentence) {
         pageHighlighter.highlight(sentence);
@@ -183,7 +247,7 @@ function initNovelTTS(): void {
       return;
     }
 
-    // idle / error 状态启动播放：必须在任何 await 之前同步解锁！
+    // idle / error 启动播放：同步解锁音频
     const currentCfg = ConfigStorage.load();
     const hasWorker = Boolean(currentCfg.workerUrl.trim());
 
@@ -194,25 +258,26 @@ function initNovelTTS(): void {
     }
 
     try {
-      const chapter = ensureCurrentChapterParsed(readerView.isOpen());
-      if (!chapter) {
+      const target = ensureInitialChapterParsed(readerView.isOpen());
+      if (!target) {
         bar.showToast('未识别到小说正文，无法播放');
         return;
       }
 
-      if (!readerView.isOpen() && currentChapterUrl === initialPageUrl) {
+      if (!readerView.isOpen() && target.url === initialPageUrl) {
         pageHighlighter.setContainer(findContentElement(document));
       }
 
-      await player.playChapter(chapter);
+      playingChapterId = target.id;
+      await player.playChapter(target.chapter);
     } catch (err: any) {
       console.error('[NovelTTS] Play error:', err);
       bar.showToast(`播放失败: ${err?.message || err}`);
     }
   };
 
-  // 从阅读模式双击任意句直接起播 / 跳转（严格同步首行解锁）
-  const handleSeekSentence = (chunkIndex: number): void => {
+  // 双击阅读模式任意章节中的任意一句直接起播 / 跳播
+  const handleSeekSentence = (chapterId: string, chunkIndex: number): void => {
     if (isChapterLoading) {
       bar.showToast('正在加载章节，请稍候…');
       return;
@@ -226,23 +291,155 @@ function initNovelTTS(): void {
       player.switchToFallback('未配置 Worker，已自动使用系统语音朗读');
     }
 
-    const chapter = ensureCurrentChapterParsed(true);
-    if (!chapter || currentChunks.length === 0) {
+    const target =
+      loadedChapters.find((c) => c.id === chapterId) || ensureInitialChapterParsed(true);
+    if (!target || target.chunks.length === 0) {
       bar.showToast('未识别到小说正文，无法播放');
       return;
     }
 
-    const safeIndex = Math.max(0, Math.min(chunkIndex, currentChunks.length - 1));
+    const safeIndex = Math.max(0, Math.min(chunkIndex, target.chunks.length - 1));
     bar.showToast(`从第 ${safeIndex + 1} 句开始朗读`);
 
-    if (player.getState() === 'idle' || player.getSentences().length === 0) {
-      void player.playChapter(chapter, safeIndex);
-    } else {
+    if (
+      target.id === playingChapterId &&
+      player.getState() !== 'idle' &&
+      player.getSentences().length > 0
+    ) {
       player.seek(safeIndex);
+      return;
+    }
+
+    playingChapterId = target.id;
+    bar.updateChapter(
+      target.chapter.title,
+      target.url !== initialPageUrl ? target.url : undefined
+    );
+    syncBrowserUrlAndTitle(target.url, target.chapter.title);
+    void player.playChapter(target.chapter, safeIndex);
+  };
+
+  // 无限滚动：滑近当前末章底部时静默预加载并拼接下一章
+  const handleAppendNextChapter = async (): Promise<void> => {
+    if (isAppendingNext || isChapterLoading || loadedChapters.length === 0) {
+      return;
+    }
+
+    const tail = loadedChapters[loadedChapters.length - 1];
+    const nextUrl = tail.chapter.nextChapterUrl;
+    if (!nextUrl) {
+      readerView.setAppendStatus('end');
+      return;
+    }
+
+    isAppendingNext = true;
+    readerView.setAppendStatus('loading');
+
+    try {
+      const loaded = await chapterLoader.loadChapter(nextUrl, { allowVisited: false });
+      if (loaded === null) {
+        // 已在 visitedUrls 中（防环），停止继续自动向后拼接
+        readerView.setAppendStatus('end');
+        return;
+      }
+      if (loaded.paragraphs.length === 0) {
+        throw new Error('未提取到有效正文');
+      }
+
+      const nextItem = makeLoadedChapter(nextUrl, loaded);
+      loadedChapters.push(nextItem);
+      const evictedIds = readerView.appendChapter(nextItem);
+      if (evictedIds.length > 0) {
+        loadedChapters = loadedChapters.filter((c) => !evictedIds.includes(c.id));
+      }
+    } catch (err: any) {
+      console.warn('[NovelTTS] Infinite append failed:', err);
+      readerView.setAppendStatus('error', err?.message || String(err));
+    } finally {
+      isAppendingNext = false;
     }
   };
 
-  // 上/下一章静默加载与无缝协同
+  // 本章朗读完毕后的无缝跨章接力
+  const handleChapterEnd = async (): Promise<void> => {
+    const playingIdx = loadedChapters.findIndex((c) => c.id === playingChapterId);
+
+    // 1. 下一章已在无限滚动窗口中预加载完成 -> 零等待直接续播
+    if (playingIdx >= 0 && playingIdx + 1 < loadedChapters.length) {
+      const nextItem = loadedChapters[playingIdx + 1];
+      playingChapterId = nextItem.id;
+      activeChunkIndex = -1;
+      bar.updateChapter(
+        nextItem.chapter.title,
+        nextItem.url !== initialPageUrl ? nextItem.url : undefined
+      );
+      bar.showToast(`已开始播放：${nextItem.chapter.title}`);
+      syncBrowserUrlAndTitle(nextItem.url, nextItem.chapter.title);
+
+      if (!ConfigStorage.load().workerUrl.trim()) {
+        player.switchToFallback();
+      }
+      await player.playChapter(nextItem.chapter);
+      return;
+    }
+
+    // 2. 阅读模式下开启无限滚动且下一章尚未预加载 -> 静默拉取后追加拼接并续播
+    const cfg = ConfigStorage.load();
+    if (readerView.isOpen() && cfg.reader.infiniteScroll) {
+      const playing = getPlayingChapter();
+      const targetUrl =
+        playing?.chapter.nextChapterUrl || extractNextChapterUrl(document, window.location.href);
+
+      if (!targetUrl) {
+        bar.showToast('已播放至最后一章');
+        return;
+      }
+      if (isChapterLoading || isAppendingNext) return;
+
+      isChapterLoading = true;
+      readerView.setChapterLoading(true);
+      bar.showToast('正在加载下一章…');
+
+      try {
+        const loaded = await chapterLoader.loadChapter(targetUrl, { allowVisited: false });
+        if (!loaded || loaded.paragraphs.length === 0) {
+          throw new Error('下一章正文提取失败或已到达边界');
+        }
+
+        const nextItem = makeLoadedChapter(targetUrl, loaded);
+        loadedChapters.push(nextItem);
+        const evictedIds = readerView.appendChapter(nextItem);
+        if (evictedIds.length > 0) {
+          loadedChapters = loadedChapters.filter((c) => !evictedIds.includes(c.id));
+        }
+
+        playingChapterId = nextItem.id;
+        bar.updateChapter(
+          nextItem.chapter.title,
+          nextItem.url !== initialPageUrl ? nextItem.url : undefined
+        );
+        bar.showToast(`已开始播放：${nextItem.chapter.title}`);
+        syncBrowserUrlAndTitle(nextItem.url, nextItem.chapter.title);
+
+        if (!cfg.workerUrl.trim()) {
+          player.switchToFallback();
+        }
+        await player.playChapter(nextItem.chapter);
+      } catch (err: any) {
+        console.warn('[NovelTTS] Auto-append next chapter on play end failed:', err);
+        bar.showToast(`下一章自动加载失败 (${err?.message || err})，可点下一章直接跳转`);
+      } finally {
+        isChapterLoading = false;
+        readerView.setChapterLoading(false);
+      }
+      return;
+    }
+
+    // 3. 普通单章或原网页模式：替换加载下一章
+    await handleLoadChapter('next', { isManual: false, autoPlay: true });
+  };
+
+  // 手动上下章切换（或非无限滚动模式自动切章）
   const handleLoadChapter = async (
     direction: 'prev' | 'next',
     options: { isManual: boolean; autoPlay: boolean }
@@ -253,13 +450,39 @@ function initNovelTTS(): void {
 
     if (isChapterLoading) return;
 
+    // 若在阅读模式点“下一章”且后续章已拼接在当前窗口中，直接平滑切换过去
+    const vis = getVisibleChapter();
+    if (direction === 'next' && readerView.isOpen() && vis) {
+      const visIdx = loadedChapters.findIndex((c) => c.id === vis.id);
+      if (visIdx >= 0 && visIdx + 1 < loadedChapters.length) {
+        const nextLoaded = loadedChapters[visIdx + 1];
+        readerView.scrollToChapter(nextLoaded.id);
+        bar.updateChapter(
+          nextLoaded.chapter.title,
+          nextLoaded.url !== initialPageUrl ? nextLoaded.url : undefined
+        );
+        syncBrowserUrlAndTitle(nextLoaded.url, nextLoaded.chapter.title);
+
+        if (options.autoPlay) {
+          if (player.getState() !== 'idle') player.stop();
+          playingChapterId = nextLoaded.id;
+          bar.showToast(`已开始播放：${nextLoaded.chapter.title}`);
+          if (!ConfigStorage.load().workerUrl.trim()) {
+            player.switchToFallback();
+          }
+          await player.playChapter(nextLoaded.chapter);
+        }
+        return;
+      }
+    }
+
     let targetUrl: string | null = null;
     if (direction === 'next') {
-      targetUrl =
-        currentChapter?.nextChapterUrl || extractNextChapterUrl(document, window.location.href);
+      const tail = loadedChapters[loadedChapters.length - 1];
+      targetUrl = tail?.chapter.nextChapterUrl || extractNextChapterUrl(document, window.location.href);
     } else {
-      targetUrl =
-        currentChapter?.prevChapterUrl || extractPrevChapterUrl(document, window.location.href);
+      const head = loadedChapters[0];
+      targetUrl = head?.chapter.prevChapterUrl || extractPrevChapterUrl(document, window.location.href);
     }
 
     if (!targetUrl) {
@@ -284,28 +507,17 @@ function initNovelTTS(): void {
         throw new Error('章节正文提取失败或已到达边界');
       }
 
-      currentChapter = loaded;
-      currentChapterUrl = targetUrl;
-      currentChunks = chunkParagraphs(loaded.paragraphs);
+      const newItem = makeLoadedChapter(targetUrl, loaded);
+      loadedChapters = [newItem];
+      visibleChapterId = newItem.id;
+      playingChapterId = options.autoPlay ? newItem.id : null;
       activeChunkIndex = -1;
       pageHighlighter.resetPosition();
 
       const isCrossChapter = targetUrl !== initialPageUrl;
       bar.updateChapter(loaded.title, isCrossChapter ? targetUrl : undefined);
-      readerView.renderChapter(
-        loaded,
-        currentChunks,
-        isCrossChapter ? targetUrl : undefined
-      );
-
-      // 同步浏览器地址与标题（同源策略安全防护）
-      try {
-        window.history.replaceState(null, '', targetUrl);
-        document.title = loaded.title;
-      } catch {
-        // 跨域或沙箱环境静默忽略
-      }
-      lastSeenHref = window.location.href;
+      readerView.replaceChapter(newItem);
+      syncBrowserUrlAndTitle(targetUrl, loaded.title);
 
       if (options.autoPlay) {
         bar.showToast(`已开始播放：${loaded.title}`);
@@ -314,8 +526,8 @@ function initNovelTTS(): void {
         }
         await player.playChapter(loaded);
       } else {
-        bar.updateProgress(-1, currentChunks.length);
-        readerView.updateProgress(-1, currentChunks.length);
+        bar.updateProgress(-1, newItem.chunks.length);
+        readerView.updateProgress(-1, newItem.chunks.length);
         bar.showToast(`已加载：${loaded.title}`);
       }
     } catch (err: any) {
@@ -329,6 +541,219 @@ function initNovelTTS(): void {
       } else {
         bar.showToast(`下一章自动加载失败 (${err?.message || err})，可点下一章直接跳转`);
       }
+    } finally {
+      isChapterLoading = false;
+      readerView.setChapterLoading(false);
+    }
+  };
+
+  // 目录链接探测与抽屉联动
+  const resolveTocUrl = (): string | null => {
+    const vis = getVisibleChapter();
+    return vis?.chapter.tocUrl || knownTocUrl || extractTocUrl(document, window.location.href);
+  };
+
+  const handleOpenToc = async (forceRefresh = false): Promise<void> => {
+    const tocUrl = resolveTocUrl();
+    const currentVisUrl = getVisibleChapter()?.url || window.location.href;
+
+    if (!tocUrl) {
+      readerView.setTocState(
+        {
+          status: 'error',
+          tocUrl: null,
+          errorMessage: '当前页面未识别到目录链接',
+          items: [],
+          historyItems: readingHistory,
+        },
+        currentVisUrl
+      );
+      return;
+    }
+
+    const cached = tocCache.get(tocUrl);
+    if (cached && !forceRefresh) {
+      readerView.setTocState(
+        {
+          status: 'ready',
+          tocUrl,
+          bookTitle: cached.bookTitle,
+          items: cached.items,
+          nextPageUrl: cached.nextPageUrl,
+          historyItems: readingHistory,
+        },
+        currentVisUrl
+      );
+      return;
+    }
+
+    readerView.setTocState(
+      {
+        status: 'loading',
+        tocUrl,
+        items: [],
+        historyItems: readingHistory,
+      },
+      currentVisUrl
+    );
+
+    try {
+      const data = await chapterLoader.loadToc(tocUrl);
+      tocCache.set(tocUrl, data);
+      readerView.setTocState(
+        {
+          status: data.items.length > 0 ? 'ready' : 'error',
+          tocUrl,
+          bookTitle: data.bookTitle,
+          items: data.items,
+          nextPageUrl: data.nextPageUrl,
+          errorMessage: data.items.length === 0 ? '未能从目录页解析出章节列表' : undefined,
+          historyItems: readingHistory,
+        },
+        currentVisUrl
+      );
+    } catch (err: any) {
+      console.warn('[NovelTTS] Load TOC failed:', err);
+      readerView.setTocState(
+        {
+          status: 'error',
+          tocUrl,
+          errorMessage: `目录抓取受限 (${err?.message || err})`,
+          items: [],
+          historyItems: readingHistory,
+        },
+        currentVisUrl
+      );
+    }
+  };
+
+  const handleLoadMoreToc = async (nextPageUrl: string): Promise<void> => {
+    const tocUrl = resolveTocUrl();
+    if (!tocUrl || tocLoadingMore) return;
+    const cached = tocCache.get(tocUrl);
+    if (!cached) return;
+
+    tocLoadingMore = true;
+    const currentVisUrl = getVisibleChapter()?.url || window.location.href;
+
+    readerView.setTocState(
+      {
+        status: 'ready',
+        tocUrl,
+        bookTitle: cached.bookTitle,
+        items: cached.items,
+        nextPageUrl: cached.nextPageUrl,
+        loadingMore: true,
+        historyItems: readingHistory,
+      },
+      currentVisUrl
+    );
+
+    try {
+      const moreData = await chapterLoader.loadToc(nextPageUrl);
+      const seen = new Set(cached.items.map((it) => it.url));
+      for (const item of moreData.items) {
+        if (!seen.has(item.url)) {
+          seen.add(item.url);
+          cached.items.push(item);
+        }
+      }
+      cached.nextPageUrl = moreData.nextPageUrl;
+    } catch (err: any) {
+      bar.showToast(`加载下一页目录失败: ${err?.message || err}`);
+    } finally {
+      tocLoadingMore = false;
+      readerView.setTocState(
+        {
+          status: 'ready',
+          tocUrl,
+          bookTitle: cached.bookTitle,
+          items: cached.items,
+          nextPageUrl: cached.nextPageUrl,
+          loadingMore: false,
+          historyItems: readingHistory,
+        },
+        currentVisUrl
+      );
+    }
+  };
+
+  const handleSelectTocChapter = async (targetUrl: string, title: string): Promise<void> => {
+    if (isChapterLoading) {
+      bar.showToast('正在加载章节，请稍候…');
+      return;
+    }
+
+    const wasListening = isPlayerActive();
+    if (wasListening) {
+      const hasWorker = Boolean(ConfigStorage.load().workerUrl.trim());
+      if (hasWorker) {
+        player.unlockAllAudio({ audio: true, speech: true });
+      }
+    }
+
+    const targetId = toChapterId(targetUrl);
+    const existing = loadedChapters.find((c) => c.id === targetId);
+    if (existing) {
+      visibleChapterId = existing.id;
+      readerView.scrollToChapter(existing.id);
+      bar.updateChapter(
+        existing.chapter.title,
+        existing.url !== initialPageUrl ? existing.url : undefined
+      );
+      syncBrowserUrlAndTitle(existing.url, existing.chapter.title);
+
+      if (wasListening) {
+        if (player.getState() !== 'idle') player.stop();
+        playingChapterId = existing.id;
+        await player.playChapter(existing.chapter);
+      }
+      return;
+    }
+
+    if (player.getState() !== 'idle') {
+      player.stop();
+    }
+
+    isChapterLoading = true;
+    readerView.setChapterLoading(true);
+    bar.showToast(`正在加载：${title}…`);
+
+    try {
+      chapterLoader.resetVisited(targetUrl);
+      const loaded = await chapterLoader.loadChapter(targetUrl, { allowVisited: true });
+      if (!loaded || loaded.paragraphs.length === 0) {
+        throw new Error('未能提取到章节正文');
+      }
+
+      const newItem = makeLoadedChapter(targetUrl, loaded);
+      loadedChapters = [newItem];
+      visibleChapterId = newItem.id;
+      playingChapterId = wasListening ? newItem.id : null;
+      activeChunkIndex = -1;
+      pageHighlighter.resetPosition();
+
+      bar.updateChapter(loaded.title, targetUrl !== initialPageUrl ? targetUrl : undefined);
+      readerView.replaceChapter(newItem);
+      syncBrowserUrlAndTitle(targetUrl, loaded.title);
+
+      if (wasListening) {
+        if (!ConfigStorage.load().workerUrl.trim()) {
+          player.switchToFallback();
+        }
+        bar.showToast(`已开始播放：${loaded.title}`);
+        await player.playChapter(loaded);
+      } else {
+        bar.updateProgress(-1, newItem.chunks.length);
+        readerView.updateProgress(-1, newItem.chunks.length);
+        bar.showToast(`已跳转：${loaded.title}`);
+      }
+    } catch (err: any) {
+      console.warn('[NovelTTS] Jump from TOC failed:', err);
+      bar.showToast('目录跳章受限，正在打开章节原页…');
+      setTimeout(() => {
+        window.location.href = targetUrl;
+      }, 300);
     } finally {
       isChapterLoading = false;
       readerView.setChapterLoading(false);
@@ -372,7 +797,7 @@ function initNovelTTS(): void {
     return await workerProvider.testConnection(workerUrl, effectiveToken);
   };
 
-  // 5. 初始化精简版悬浮 UI 与仿夸克阅读模式 UI
+  // 5. 初始化精简悬浮球与仿夸克阅读模式
   bar = new FloatingBar(config, {
     onPlayToggle: () => {
       void handlePlayToggle();
@@ -410,6 +835,29 @@ function initNovelTTS(): void {
     onNextChapter: () => {
       void handleLoadChapter('next', { isManual: true, autoPlay: isPlayerActive() });
     },
+    onRequestAppendNext: () => {
+      void handleAppendNextChapter();
+    },
+    onOpenToc: () => {
+      void handleOpenToc(false);
+    },
+    onRefreshToc: () => {
+      void handleOpenToc(true);
+    },
+    onLoadMoreToc: (nextPageUrl) => {
+      void handleLoadMoreToc(nextPageUrl);
+    },
+    onSelectTocChapter: (url, title) => {
+      void handleSelectTocChapter(url, title);
+    },
+    onOpenExternalToc: (url) => {
+      window.location.href = url;
+    },
+    onVisibleChapterChange: (chapterId, chapterUrl, title) => {
+      visibleChapterId = chapterId;
+      bar.updateChapter(title, chapterUrl !== initialPageUrl ? chapterUrl : undefined);
+      syncBrowserUrlAndTitle(chapterUrl, title);
+    },
     onRateChange: handleRateChange,
     onVoiceChange: handleVoiceChange,
     onSaveConfig: handleSaveConfig,
@@ -428,8 +876,12 @@ function initNovelTTS(): void {
     if (!ConfigStorage.load().reader.autoEnter || readerView.isOpen()) {
       return;
     }
-    const chapter = ensureCurrentChapterParsed(true);
-    if (chapter && chapter.paragraphs.length >= 2 && countEffectiveChars(chapter.paragraphs) >= 200) {
+    const item = ensureInitialChapterParsed(true);
+    if (
+      item &&
+      item.chapter.paragraphs.length >= 2 &&
+      countEffectiveChars(item.chapter.paragraphs) >= 200
+    ) {
       openReader();
     }
   };

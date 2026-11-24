@@ -230,5 +230,42 @@ describe('chapterLoader.ts - 静默下一章加载与编码探测', () => {
       const result = await loader.loadChapter('javascript:void(0)');
       expect(result).toBeNull();
     });
+
+    it('loadToc：正确解析 UTF-8 / GBK 目录页且不污染 visitedUrls', async () => {
+      const prefix = new TextEncoder().encode(
+        '<html><head><meta charset="gbk"><title>测试书名</title></head><body><div id="list"><dl><dt>正文</dt>'
+      );
+      // "第一章" in GBK: B5 DA D2 BB D5 C2
+      const gbkChapter = [0xb5, 0xda, 0xd2, 0xbb, 0xd5, 0xc2];
+      const suffix = new TextEncoder().encode(
+        '</dl></div></body></html>'
+      );
+      const mid1 = new TextEncoder().encode('<dd><a href="/book/1/1.html">');
+      const mid2 = new TextEncoder().encode('</a></dd><dd><a href="/book/1/2.html">ch2</a></dd><dd><a href="/book/1/3.html">ch3</a></dd>');
+      const parts = [prefix, mid1, new Uint8Array(gbkChapter), mid2, suffix];
+      const totalLen = parts.reduce((s, p) => s + p.length, 0);
+      const buf = new Uint8Array(totalLen);
+      let off = 0;
+      for (const p of parts) {
+        buf.set(p, off);
+        off += p.length;
+      }
+
+      const currentOrigin = window.location.origin;
+      const tocUrl = `${currentOrigin}/book/1/`;
+      window.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        arrayBuffer: async () => buf.buffer,
+      } as any);
+
+      const loader = new ChapterLoader(`${currentOrigin}/book/1/1.html`);
+      const toc = await loader.loadToc(tocUrl);
+
+      expect(toc.items.length).toBe(3);
+      expect(toc.items[0].title).toBe('第一章');
+      expect(loader.hasVisited(tocUrl)).toBe(false);
+    });
   });
 });

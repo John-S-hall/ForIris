@@ -1,7 +1,9 @@
 import type { AppConfig, ReaderSettings, ReaderTheme } from '../core/storage';
 import type { StructuredChunk } from '../core/chunker';
 import type { ConnectionTestResult } from '../core/tts/edgeWorker';
-import type { ChapterContent, PlayerState } from '../core/tts/types';
+import { normalizeHttpUrl } from '../core/tocExtractor';
+import type { ChapterContent, PlayerState, TocItem } from '../core/tts/types';
+import { READER_STYLES } from './readerStyles';
 import {
   SVG_PAUSE_PATH,
   SVG_PLAY_PATH,
@@ -10,15 +12,42 @@ import {
   getNextRate,
 } from './sharedControls';
 
+export interface LoadedReaderChapter {
+  id: string;
+  url: string;
+  chapter: ChapterContent;
+  chunks: StructuredChunk[];
+}
+
+export interface TocViewState {
+  status: 'idle' | 'loading' | 'ready' | 'error';
+  tocUrl?: string | null;
+  bookTitle?: string;
+  items: TocItem[];
+  nextPageUrl?: string | null;
+  loadingMore?: boolean;
+  errorMessage?: string;
+  historyItems?: TocItem[];
+}
+
+export type AppendStatus = 'idle' | 'loading' | 'error' | 'end';
+
 export interface ReaderViewEvents {
   onClose: () => void;
   onPlayToggle: () => void;
   onStop: () => void;
   onPrevSentence: () => void;
   onNextSentence: () => void;
-  onSeekSentence: (chunkIndex: number) => void;
+  onSeekSentence: (chapterId: string, chunkIndex: number) => void;
   onPrevChapter: () => void;
   onNextChapter: () => void;
+  onRequestAppendNext: () => void;
+  onOpenToc: () => void;
+  onRefreshToc: () => void;
+  onLoadMoreToc: (nextPageUrl: string) => void;
+  onSelectTocChapter: (url: string, title: string) => void;
+  onOpenExternalToc: (url: string) => void;
+  onVisibleChapterChange?: (chapterId: string, chapterUrl: string, title: string) => void;
   onRateChange: (rate: number) => void;
   onVoiceChange: (voice: string) => void;
   onSaveConfig: (workerUrl: string, token: string) => void;
@@ -31,11 +60,15 @@ export interface ReaderViewEvents {
 type DockSubpanel = 'none' | 'appearance' | 'tts' | 'worker';
 
 const USER_SCROLL_PROTECT_MS = 4000;
+const MAX_RENDERED_CHAPTERS = 5;
+const INFINITE_SCROLL_PRELOAD_PX = 700;
+
 const LINE_HEIGHT_PRESETS: ReadonlyArray<{ value: number; label: string }> = [
   { value: 1.6, label: '紧凑' },
   { value: 1.85, label: '适中' },
   { value: 2.1, label: '宽松' },
 ];
+
 const THEME_PRESETS: ReadonlyArray<{ value: ReaderTheme; label: string; swatch: string }> = [
   { value: 'light', label: '日间', swatch: '#ffffff' },
   { value: 'sepia', label: '羊皮纸', swatch: '#f4ecd8' },
@@ -44,22 +77,35 @@ const THEME_PRESETS: ReadonlyArray<{ value: ReaderTheme; label: string; swatch: 
 ];
 
 /**
- * 仿夸克浏览器的上下滚动精简版阅读模式（Shadow DOM 完全隔离）
+ * 仿夸克浏览器精简版阅读模式（Shadow DOM 隔离，支持目录抽屉与无限滚动拼接）
  */
 export class ReaderView {
   private host: HTMLElement;
   private shadow: ShadowRoot;
   private events: ReaderViewEvents;
+  private initialNormUrl: string | null = null;
 
   private settings: ReaderSettings;
   private currentRate: number;
   private playerState: PlayerState = 'idle';
+
+  // 多章节滑动窗口
+  private chapters: LoadedReaderChapter[] = [];
+  private chapterSectionMap = new Map<string, HTMLElement>();
+  private visibleChapterId: string | null = null;
+  private activeChapterId: string | null = null;
   private activeChunkIndex = -1;
   private totalChunks = 0;
-  private currentChapterUrl: string | null = null;
-  private hasPrevChapter = false;
-  private hasNextChapter = false;
   private isChapterLoading = false;
+  private appendStatus: AppendStatus = 'idle';
+  private appendErrorMessage = '';
+
+  // 目录抽屉状态
+  private isTocOpen = false;
+  private tocSortDesc = false;
+  private tocSearchQuery = '';
+  private tocActiveUrl = '';
+  private tocState: TocViewState = { status: 'idle', items: [] };
 
   private opened = false;
   private isMenuOpen = false;
@@ -72,6 +118,7 @@ export class ReaderView {
   // 手动滑动保护与双击识别
   private lastUserScrollAt = 0;
   private programmaticScrollUntil = 0;
+  private lastTapChapterId = '';
   private lastTapChunkIdx = -1;
   private lastTapAt = 0;
   private singleTapTimer: ReturnType<typeof setTimeout> | null = null;
@@ -81,8 +128,9 @@ export class ReaderView {
   private scrollEl!: HTMLElement;
   private statusTitleEl!: HTMLElement;
   private statusProgressEl!: HTMLElement;
-  private articleTitleEl!: HTMLElement;
-  private articleBodyEl!: HTMLElement;
+  private topPrevBtn!: HTMLButtonElement;
+  private chaptersRootEl!: HTMLElement;
+  private tailStatusEl!: HTMLElement;
   private footerPrevBtn!: HTMLButtonElement;
   private footerNextBtn!: HTMLButtonElement;
   private relocateBtn!: HTMLButtonElement;
@@ -103,6 +151,7 @@ export class ReaderView {
 
   private fontValEl!: HTMLElement;
   private autoEnterInput!: HTMLInputElement;
+  private infiniteScrollInput!: HTMLInputElement;
 
   private ttsProgressEl!: HTMLElement;
   private ttsPlayBtn!: HTMLButtonElement;
@@ -115,15 +164,28 @@ export class ReaderView {
   private testBtn!: HTMLButtonElement;
   private testResultEl!: HTMLElement;
 
-  private dockPrevChBtn!: HTMLButtonElement;
+  private dockTocBtn!: HTMLButtonElement;
   private dockTtsBtn!: HTMLButtonElement;
   private dockAppearanceBtn!: HTMLButtonElement;
   private dockNextChBtn!: HTMLButtonElement;
+
+  // 目录抽屉 DOM
+  private tocBackdropEl!: HTMLElement;
+  private tocDrawerEl!: HTMLElement;
+  private tocBookTitleEl!: HTMLElement;
+  private tocSearchInput!: HTMLInputElement;
+  private tocSortBtn!: HTMLButtonElement;
+  private tocListEl!: HTMLElement;
+  private tocRefreshBtn!: HTMLButtonElement;
+  private tocExternalBtn!: HTMLButtonElement;
 
   constructor(config: AppConfig, events: ReaderViewEvents) {
     this.events = events;
     this.settings = { ...config.reader };
     this.currentRate = config.rate;
+    if (typeof window !== 'undefined' && window.location?.href) {
+      this.initialNormUrl = normalizeHttpUrl(window.location.href, window.location.href);
+    }
 
     this.host = document.createElement('novel-tts-reader-host');
     this.host.id = 'novel-tts-reader-root';
@@ -181,6 +243,7 @@ export class ReaderView {
 
     this.host.style.setProperty('display', 'block', 'important');
     this.setMenuOpen(false);
+    this.closeTocDrawer();
     this.updateScrollStatus();
     this.updateRelocateVisibility();
   }
@@ -190,6 +253,7 @@ export class ReaderView {
     this.opened = false;
     this.clearSingleTapTimer();
     this.setMenuOpen(false);
+    this.closeTocDrawer();
     this.host.style.setProperty('display', 'none', 'important');
     this.restorePageOverflow();
   }
@@ -211,6 +275,7 @@ export class ReaderView {
       clearTimeout(this.singleTapTimer);
       this.singleTapTimer = null;
     }
+    this.lastTapChapterId = '';
     this.lastTapChunkIdx = -1;
     this.lastTapAt = 0;
   }
@@ -219,32 +284,21 @@ export class ReaderView {
     this.events.onToast?.(message);
   }
 
-  // ─── 章节渲染与状态同步 ────────────────────────────────────────────────
+  // ─── 多章节渲染与窗口管理 ──────────────────────────────────────────────
 
-  renderChapter(
-    chapter: ChapterContent,
-    chunks: StructuredChunk[],
-    chapterUrl?: string
-  ): void {
-    const title = chapter.title || '正文阅读';
-    this.statusTitleEl.textContent = title;
-    this.topTitleEl.textContent = title;
-    this.articleTitleEl.textContent = title;
+  private buildChapterSection(item: LoadedReaderChapter): HTMLElement {
+    const section = document.createElement('section');
+    section.className = 'reader-chapter';
+    section.setAttribute('data-chapter-id', item.id);
+    section.setAttribute('data-chapter-url', item.url);
 
-    this.currentChapterUrl = chapterUrl || null;
-    this.jumpBtn.style.display = chapterUrl ? 'inline-flex' : 'none';
+    const h1 = document.createElement('h1');
+    h1.className = 'reader-chapter-title';
+    h1.textContent = item.chapter.title || '正文阅读';
+    section.appendChild(h1);
 
-    this.hasPrevChapter = Boolean(chapter.prevChapterUrl);
-    this.hasNextChapter = Boolean(chapter.nextChapterUrl);
-    this.updateChapterButtonsDisabled();
-
-    this.totalChunks = chunks.length;
-    this.activeChunkIndex = -1;
-    this.lastUserScrollAt = 0;
-
-    // 按段落索引分组 chunk 片段
     const segmentsByParagraph = new Map<number, Array<{ chunkIndex: number; text: string }>>();
-    for (const chunk of chunks) {
+    for (const chunk of item.chunks) {
       for (const seg of chunk.segments) {
         let list = segmentsByParagraph.get(seg.paragraphIndex);
         if (!list) {
@@ -255,8 +309,7 @@ export class ReaderView {
       }
     }
 
-    const fragment = document.createDocumentFragment();
-    chapter.paragraphs.forEach((paraText, pIdx) => {
+    item.chapter.paragraphs.forEach((paraText, pIdx) => {
       const pEl = document.createElement('p');
       pEl.className = 'reader-p';
       const segs = segmentsByParagraph.get(pIdx);
@@ -264,6 +317,7 @@ export class ReaderView {
         for (const seg of segs) {
           const span = document.createElement('span');
           span.className = 'reader-sentence';
+          span.setAttribute('data-chapter-id', item.id);
           span.setAttribute('data-chunk-index', String(seg.chunkIndex));
           span.textContent = seg.text;
           pEl.appendChild(span);
@@ -271,33 +325,183 @@ export class ReaderView {
       } else {
         pEl.textContent = paraText;
       }
-      fragment.appendChild(pEl);
+      section.appendChild(pEl);
     });
 
-    this.articleBodyEl.replaceChildren(fragment);
+    return section;
+  }
 
-    // 新章节滚回顶部
+  replaceChapter(item: LoadedReaderChapter): void {
+    this.chapters = [item];
+    this.chapterSectionMap.clear();
+
+    const section = this.buildChapterSection(item);
+    this.chapterSectionMap.set(item.id, section);
+    this.chaptersRootEl.replaceChildren(section);
+
+    this.visibleChapterId = item.id;
+    this.activeChapterId = null;
+    this.activeChunkIndex = -1;
+    this.totalChunks = item.chunks.length;
+    this.lastUserScrollAt = 0;
+
+    this.appendStatus = item.chapter.nextChapterUrl ? 'idle' : 'end';
+    this.appendErrorMessage = '';
+
+    this.applyVisibleChapterMeta(item);
+    this.updateChapterControlsUI();
+
     this.programmaticScrollUntil = Date.now() + 300;
     this.scrollEl.scrollTop = 0;
     this.updateScrollStatus();
     this.updateRelocateVisibility();
   }
 
-  setActiveChunk(index: number): void {
+  /**
+   * 无限滚动向末尾追加新章节，超出 MAX_RENDERED_CHAPTERS 时自动裁剪较早章节 DOM 并保持视口零跳动
+   * 返回被裁剪掉的章节 ID 列表供外部同步清理
+   */
+  appendChapter(item: LoadedReaderChapter): string[] {
+    if (this.chapters.some((c) => c.id === item.id)) {
+      return [];
+    }
+
+    this.chapters.push(item);
+    const section = this.buildChapterSection(item);
+    this.chapterSectionMap.set(item.id, section);
+    this.chaptersRootEl.appendChild(section);
+
+    const evicted: string[] = [];
+    while (this.chapters.length > MAX_RENDERED_CHAPTERS) {
+      const oldest = this.chapters[0];
+      if (oldest.id !== this.activeChapterId && oldest.id !== this.visibleChapterId) {
+        this.evictChapterAt(0, evicted);
+        continue;
+      }
+      // 保护正在播放或正在阅读的章节，转而淘汰中间较早的可释放章节
+      const altIdx = this.chapters.findIndex(
+        (c, idx) =>
+          idx > 0 &&
+          idx < this.chapters.length - 1 &&
+          c.id !== this.activeChapterId &&
+          c.id !== this.visibleChapterId
+      );
+      if (altIdx === -1) break;
+      this.evictChapterAt(altIdx, evicted);
+    }
+
+    this.appendStatus = item.chapter.nextChapterUrl ? 'idle' : 'end';
+    this.appendErrorMessage = '';
+    this.updateChapterControlsUI();
+    return evicted;
+  }
+
+  private evictChapterAt(index: number, evictedOut: string[]): void {
+    const [removed] = this.chapters.splice(index, 1);
+    const sec = this.chapterSectionMap.get(removed.id);
+    if (sec && sec.parentNode) {
+      const beforeHeight = this.scrollEl.scrollHeight;
+      sec.parentNode.removeChild(sec);
+      const afterHeight = this.scrollEl.scrollHeight;
+      const delta = beforeHeight - afterHeight;
+      if (delta > 0) {
+        this.programmaticScrollUntil = Date.now() + 300;
+        this.scrollEl.scrollTop = Math.max(0, this.scrollEl.scrollTop - delta);
+      }
+    }
+    this.chapterSectionMap.delete(removed.id);
+    evictedOut.push(removed.id);
+  }
+
+  setAppendStatus(status: AppendStatus, errorMsg?: string): void {
+    this.appendStatus = status;
+    this.appendErrorMessage = errorMsg || '';
+    this.updateChapterControlsUI();
+  }
+
+  setChapterLoading(loading: boolean): void {
+    this.isChapterLoading = loading;
+    this.updateChapterControlsUI();
+  }
+
+  private applyVisibleChapterMeta(vis: LoadedReaderChapter): void {
+    const title = vis.chapter.title || '正文阅读';
+    this.statusTitleEl.textContent = title;
+    this.topTitleEl.textContent = title;
+
+    const visNorm = normalizeHttpUrl(vis.url, vis.url);
+    const showJump = Boolean(vis.url && (!this.initialNormUrl || visNorm !== this.initialNormUrl));
+    this.jumpBtn.style.display = showJump ? 'inline-flex' : 'none';
+  }
+
+  private updateChapterControlsUI(): void {
+    const head = this.chapters[0];
+    const tail = this.chapters[this.chapters.length - 1];
+    const visible = this.chapters.find((c) => c.id === this.visibleChapterId) || head;
+
+    const hasPrev = Boolean(head?.chapter.prevChapterUrl);
+    const hasTailNext = Boolean(tail?.chapter.nextChapterUrl);
+    const hasVisibleNext = Boolean(visible?.chapter.nextChapterUrl || hasTailNext);
+
+    this.topPrevBtn.disabled = this.isChapterLoading || !hasPrev;
+    this.footerPrevBtn.disabled = this.isChapterLoading || !hasPrev;
+    this.footerPrevBtn.style.display = this.settings.infiniteScroll ? 'none' : 'block';
+    this.dockNextChBtn.disabled = this.isChapterLoading || !hasVisibleNext;
+
+    if (!hasTailNext || this.appendStatus === 'end') {
+      this.tailStatusEl.textContent = '已是最新章节';
+      this.footerNextBtn.textContent = '已到末尾';
+      this.footerNextBtn.disabled = true;
+      return;
+    }
+
+    if (this.appendStatus === 'loading' || this.isChapterLoading) {
+      this.tailStatusEl.textContent = '正在静默加载下一章…';
+      this.footerNextBtn.textContent = '加载中…';
+      this.footerNextBtn.disabled = true;
+      return;
+    }
+
+    if (this.appendStatus === 'error') {
+      this.tailStatusEl.textContent = this.appendErrorMessage
+        ? `自动加载受限 (${this.appendErrorMessage})`
+        : '自动加载受限，可点击下方按钮跳转下一章';
+      this.footerNextBtn.textContent = '直接跳转下一章';
+      this.footerNextBtn.disabled = false;
+      return;
+    }
+
+    this.tailStatusEl.textContent = this.settings.infiniteScroll
+      ? '继续下滑将自动无缝加载下一章'
+      : '';
+    this.footerNextBtn.textContent = '下一章';
+    this.footerNextBtn.disabled = false;
+  }
+
+  // ─── 句级高亮与平滑跟随 ────────────────────────────────────────────────
+
+  setActiveChunk(chapterId: string | null, index: number): void {
+    this.activeChapterId = chapterId;
     this.activeChunkIndex = index;
 
-    const prevActives = this.articleBodyEl.querySelectorAll('.reader-sentence.active');
-    prevActives.forEach((el) => el.classList.remove('active'));
+    this.chaptersRootEl
+      .querySelectorAll('.reader-sentence.active')
+      .forEach((el) => el.classList.remove('active'));
 
-    if (index < 0) {
+    if (!chapterId || index < 0) {
       this.updateRelocateVisibility();
       this.updateScrollStatus();
       return;
     }
 
-    const targets = this.articleBodyEl.querySelectorAll(
-      `.reader-sentence[data-chunk-index="${index}"]`
-    );
+    const sectionEl = this.chapterSectionMap.get(chapterId);
+    if (!sectionEl) {
+      this.updateRelocateVisibility();
+      this.updateScrollStatus();
+      return;
+    }
+
+    const targets = sectionEl.querySelectorAll(`.reader-sentence[data-chunk-index="${index}"]`);
     targets.forEach((el) => el.classList.add('active'));
 
     const firstEl = targets[0] as HTMLElement | undefined;
@@ -307,6 +511,15 @@ export class ReaderView {
 
     this.updateScrollStatus();
     this.updateRelocateVisibility();
+  }
+
+  private findFirstActiveSentenceEl(): HTMLElement | null {
+    if (!this.activeChapterId || this.activeChunkIndex < 0) return null;
+    const sectionEl = this.chapterSectionMap.get(this.activeChapterId);
+    if (!sectionEl) return null;
+    return sectionEl.querySelector(
+      `.reader-sentence[data-chunk-index="${this.activeChunkIndex}"]`
+    ) as HTMLElement | null;
   }
 
   private scrollToSentenceEl(el: HTMLElement): void {
@@ -336,19 +549,35 @@ export class ReaderView {
     }
   }
 
-  setChapterLoading(loading: boolean): void {
-    this.isChapterLoading = loading;
-    this.updateChapterButtonsDisabled();
+  /** 将视口滚动定位到当前窗口内已渲染的某一章 */
+  scrollToChapter(chapterId: string): boolean {
+    const sectionEl = this.chapterSectionMap.get(chapterId);
+    if (!sectionEl) return false;
+
+    const scrollRect = this.scrollEl.getBoundingClientRect();
+    if (scrollRect.height <= 0) {
+      try {
+        sectionEl.scrollIntoView();
+      } catch {
+        // ignore
+      }
+    } else {
+      const secRect = sectionEl.getBoundingClientRect();
+      const targetTop = Math.max(0, secRect.top - scrollRect.top + this.scrollEl.scrollTop - 10);
+      this.programmaticScrollUntil = Date.now() + 500;
+      this.scrollEl.scrollTop = targetTop;
+    }
+
+    const ch = this.chapters.find((c) => c.id === chapterId);
+    if (ch) {
+      this.visibleChapterId = ch.id;
+      this.applyVisibleChapterMeta(ch);
+      this.updateChapterControlsUI();
+    }
+    return true;
   }
 
-  private updateChapterButtonsDisabled(): void {
-    const prevDisabled = this.isChapterLoading || !this.hasPrevChapter;
-    const nextDisabled = this.isChapterLoading || !this.hasNextChapter;
-    this.footerPrevBtn.disabled = prevDisabled;
-    this.dockPrevChBtn.disabled = prevDisabled;
-    this.footerNextBtn.disabled = nextDisabled;
-    this.dockNextChBtn.disabled = nextDisabled;
-  }
+  // ─── 播放状态与参数同步 ────────────────────────────────────────────────
 
   updatePlayerState(state: PlayerState): void {
     this.playerState = state;
@@ -368,9 +597,10 @@ export class ReaderView {
 
   updateProgress(index: number, total: number): void {
     this.totalChunks = total;
-    const text = total > 0 ? `${index + 1} / ${total}` : '0 / 0';
+    const safeCurrent = Math.max(0, index + 1);
+    const text = total > 0 ? `${safeCurrent} / ${total}` : '0 / 0';
     this.miniProgressEl.textContent = text;
-    this.ttsProgressEl.textContent = total > 0 ? `第 ${index + 1} / ${total} 句` : '0 / 0';
+    this.ttsProgressEl.textContent = total > 0 ? `第 ${safeCurrent} / ${total} 句` : '0 / 0';
     this.updateScrollStatus();
   }
 
@@ -396,6 +626,7 @@ export class ReaderView {
 
     this.fontValEl.textContent = `${settings.fontSize}px`;
     this.autoEnterInput.checked = Boolean(settings.autoEnter);
+    this.infiniteScrollInput.checked = Boolean(settings.infiniteScroll);
 
     this.shadow.querySelectorAll<HTMLElement>('[data-theme-opt]').forEach((btn) => {
       btn.classList.toggle('active', btn.dataset.themeOpt === settings.theme);
@@ -404,7 +635,154 @@ export class ReaderView {
       const val = Number.parseFloat(btn.dataset.lineHeight || '0');
       btn.classList.toggle('active', Math.abs(val - settings.lineHeight) < 0.05);
     });
+    this.updateChapterControlsUI();
   }
+
+  // ─── 目录抽屉管理 ──────────────────────────────────────────────────────
+
+  openTocDrawer(): void {
+    this.isTocOpen = true;
+    this.setMenuOpen(false);
+    this.tocBackdropEl.classList.add('open');
+    this.tocDrawerEl.classList.add('open');
+    this.events.onOpenToc();
+  }
+
+  closeTocDrawer(): void {
+    if (!this.isTocOpen) return;
+    this.isTocOpen = false;
+    this.tocBackdropEl.classList.remove('open');
+    this.tocDrawerEl.classList.remove('open');
+  }
+
+  setTocState(state: TocViewState, activeChapterUrl?: string): void {
+    this.tocState = {
+      ...state,
+      items: [...state.items],
+      historyItems: state.historyItems ? [...state.historyItems] : undefined,
+    };
+    if (activeChapterUrl) {
+      this.tocActiveUrl = activeChapterUrl;
+    }
+
+    this.tocBookTitleEl.textContent = state.bookTitle || '小说目录';
+    this.tocExternalBtn.disabled = !state.tocUrl;
+    this.renderTocList();
+  }
+
+  private renderTocList(): void {
+    const { status, items, nextPageUrl, loadingMore, errorMessage, historyItems } = this.tocState;
+    const visUrl =
+      this.tocActiveUrl ||
+      this.chapters.find((c) => c.id === this.visibleChapterId)?.url ||
+      '';
+    const activeNorm = visUrl ? normalizeHttpUrl(visUrl, visUrl) : null;
+
+    const frag = document.createDocumentFragment();
+
+    if (status === 'loading') {
+      const msg = document.createElement('div');
+      msg.className = 'toc-empty';
+      msg.textContent = '正在加载目录…';
+      frag.appendChild(msg);
+      this.appendHistoryItemsToFragment(frag, historyItems, activeNorm);
+      this.tocListEl.replaceChildren(frag);
+      return;
+    }
+
+    if (status === 'error' || items.length === 0) {
+      const msg = document.createElement('div');
+      msg.className = 'toc-empty';
+      msg.textContent =
+        errorMessage || (status === 'error' ? '目录抓取受限，可刷新重试或打开原站目录' : '暂无目录章节');
+      frag.appendChild(msg);
+      this.appendHistoryItemsToFragment(frag, historyItems, activeNorm);
+      this.tocListEl.replaceChildren(frag);
+      return;
+    }
+
+    const ordered = this.tocSortDesc ? [...items].reverse() : items;
+    const kw = this.tocSearchQuery.trim().toLowerCase();
+    const filtered = kw
+      ? ordered.filter((it) => it.title.toLowerCase().includes(kw))
+      : ordered;
+
+    if (filtered.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'toc-empty';
+      empty.textContent = '没有匹配的章节标题';
+      frag.appendChild(empty);
+    } else {
+      for (const item of filtered) {
+        const btn = document.createElement('button');
+        btn.className = 'toc-item';
+        btn.textContent = item.title;
+        btn.setAttribute('data-toc-url', item.url);
+        const itemNorm = normalizeHttpUrl(item.url, item.url) || item.url;
+        if (activeNorm && itemNorm === activeNorm) {
+          btn.classList.add('active');
+        }
+        btn.addEventListener('click', () => {
+          this.closeTocDrawer();
+          this.events.onSelectTocChapter(item.url, item.title);
+        });
+        frag.appendChild(btn);
+      }
+    }
+
+    if (nextPageUrl) {
+      const moreBtn = document.createElement('button');
+      moreBtn.id = 'rv-toc-load-more';
+      moreBtn.className = 'toc-load-more';
+      moreBtn.disabled = Boolean(loadingMore);
+      moreBtn.textContent = loadingMore ? '正在加载下一页目录…' : '加载下一页目录';
+      moreBtn.addEventListener('click', () => {
+        this.events.onLoadMoreToc(nextPageUrl);
+      });
+      frag.appendChild(moreBtn);
+    }
+
+    this.tocListEl.replaceChildren(frag);
+
+    const activeEl = this.tocListEl.querySelector('.toc-item.active') as HTMLElement | null;
+    if (activeEl) {
+      try {
+        activeEl.scrollIntoView({ block: 'center' });
+      } catch {
+        // jsdom 忽略
+      }
+    }
+  }
+
+  private appendHistoryItemsToFragment(
+    frag: DocumentFragment,
+    historyItems: TocItem[] | undefined,
+    activeNorm: string | null
+  ): void {
+    if (!historyItems || historyItems.length === 0) return;
+    const label = document.createElement('div');
+    label.className = 'toc-section-label';
+    label.textContent = '本次已读章节记录';
+    frag.appendChild(label);
+
+    for (const item of historyItems) {
+      const btn = document.createElement('button');
+      btn.className = 'toc-item';
+      btn.textContent = item.title;
+      btn.setAttribute('data-toc-url', item.url);
+      const itemNorm = normalizeHttpUrl(item.url, item.url) || item.url;
+      if (activeNorm && itemNorm === activeNorm) {
+        btn.classList.add('active');
+      }
+      btn.addEventListener('click', () => {
+        this.closeTocDrawer();
+        this.events.onSelectTocChapter(item.url, item.title);
+      });
+      frag.appendChild(btn);
+    }
+  }
+
+  // ─── 内部滚动、状态栏与菜单控制 ────────────────────────────────────────
 
   private isTtsActive(): boolean {
     return (
@@ -438,14 +816,7 @@ export class ReaderView {
   }
 
   private updateRelocateVisibility(): void {
-    if (!this.isTtsActive() || this.activeChunkIndex < 0) {
-      this.relocateBtn.classList.remove('visible');
-      return;
-    }
-
-    const activeEl = this.articleBodyEl.querySelector(
-      `.reader-sentence[data-chunk-index="${this.activeChunkIndex}"]`
-    ) as HTMLElement | null;
+    const activeEl = this.isTtsActive() ? this.findFirstActiveSentenceEl() : null;
     if (!activeEl) {
       this.relocateBtn.classList.remove('visible');
       return;
@@ -460,6 +831,50 @@ export class ReaderView {
     const elRect = activeEl.getBoundingClientRect();
     const outOfView = elRect.bottom < scrollRect.top + 36 || elRect.top > scrollRect.bottom - 36;
     this.relocateBtn.classList.toggle('visible', outOfView);
+  }
+
+  private updateVisibleChapterFromScroll(): void {
+    if (this.chapters.length === 0) return;
+
+    const scrollRect = this.scrollEl.getBoundingClientRect();
+    let target = this.chapters[0];
+
+    if (this.chapters.length > 1 && scrollRect.height > 0) {
+      const probeY = scrollRect.top + Math.min(scrollRect.height * 0.35, 220);
+      for (const ch of this.chapters) {
+        const sec = this.chapterSectionMap.get(ch.id);
+        if (!sec) continue;
+        const rect = sec.getBoundingClientRect();
+        if (rect.top <= probeY) {
+          target = ch;
+        }
+      }
+    }
+
+    if (target.id !== this.visibleChapterId) {
+      this.visibleChapterId = target.id;
+      this.applyVisibleChapterMeta(target);
+      this.updateChapterControlsUI();
+      this.events.onVisibleChapterChange?.(target.id, target.url, target.chapter.title || '');
+    }
+  }
+
+  private maybeTriggerInfiniteAppend(): void {
+    if (!this.opened || !this.settings.infiniteScroll || this.isChapterLoading) return;
+    if (this.appendStatus !== 'idle' || this.chapters.length === 0) return;
+
+    const tail = this.chapters[this.chapters.length - 1];
+    if (!tail.chapter.nextChapterUrl) return;
+
+    const visibleIdx = this.chapters.findIndex((c) => c.id === this.visibleChapterId);
+    if (visibleIdx < this.chapters.length - 1) return;
+
+    if (this.scrollEl.clientHeight <= 0) return;
+    const distToBottom =
+      this.scrollEl.scrollHeight - (this.scrollEl.scrollTop + this.scrollEl.clientHeight);
+    if (distToBottom <= INFINITE_SCROLL_PRELOAD_PX) {
+      this.events.onRequestAppendNext();
+    }
   }
 
   private setMenuOpen(open: boolean, initialPanel: DockSubpanel = 'none'): void {
@@ -490,561 +905,7 @@ export class ReaderView {
 
   private render(config: AppConfig): void {
     const style = document.createElement('style');
-    style.textContent = `
-      :host {
-        all: initial;
-        font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Segoe UI", Roboto, sans-serif;
-        -webkit-tap-highlight-color: transparent;
-      }
-
-      .reader-root {
-        position: fixed;
-        inset: 0;
-        display: flex;
-        flex-direction: column;
-        background: var(--bg);
-        color: var(--text);
-        --reader-font-size: 18px;
-        --reader-line-height: 1.85;
-      }
-
-      /* 4 套夸克风格主题 */
-      .reader-root[data-theme="light"] {
-        --bg: #f8fafc;
-        --surface: #ffffff;
-        --dock-bg: rgba(255, 255, 255, 0.96);
-        --text: #1e293b;
-        --muted: #64748b;
-        --border: rgba(15, 23, 42, 0.1);
-        --hl-bg: rgba(14, 165, 233, 0.2);
-        --hl-text: #0f172a;
-        --accent: #0284c7;
-        --btn-bg: rgba(15, 23, 42, 0.06);
-      }
-      .reader-root[data-theme="sepia"] {
-        --bg: #f4ecd8;
-        --surface: #efe4c8;
-        --dock-bg: rgba(246, 238, 218, 0.96);
-        --text: #3d3122;
-        --muted: #7c6950;
-        --border: rgba(61, 49, 34, 0.12);
-        --hl-bg: rgba(217, 119, 6, 0.22);
-        --hl-text: #291f14;
-        --accent: #b45309;
-        --btn-bg: rgba(61, 49, 34, 0.08);
-      }
-      .reader-root[data-theme="green"] {
-        --bg: #cce8cf;
-        --surface: #d8efd9;
-        --dock-bg: rgba(212, 238, 215, 0.96);
-        --text: #1e3322;
-        --muted: #4b6950;
-        --border: rgba(30, 51, 34, 0.12);
-        --hl-bg: rgba(16, 185, 129, 0.26);
-        --hl-text: #0f2414;
-        --accent: #059669;
-        --btn-bg: rgba(30, 51, 34, 0.08);
-      }
-      .reader-root[data-theme="dark"] {
-        --bg: #12151c;
-        --surface: #1a1f29;
-        --dock-bg: rgba(20, 25, 36, 0.96);
-        --text: #cbd5e1;
-        --muted: #64748b;
-        --border: rgba(255, 255, 255, 0.1);
-        --hl-bg: rgba(56, 189, 248, 0.22);
-        --hl-text: #f8fafc;
-        --accent: #38bdf8;
-        --btn-bg: rgba(255, 255, 255, 0.08);
-      }
-
-      /* 顶部常驻极简微状态栏 */
-      .status-header {
-        position: fixed;
-        top: 0;
-        left: 0;
-        right: 0;
-        height: calc(30px + env(safe-area-inset-top, 0px));
-        padding: env(safe-area-inset-top, 0px) 18px 0;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-        font-size: 11px;
-        color: var(--muted);
-        background: var(--bg);
-        z-index: 2;
-        pointer-events: none;
-        box-sizing: border-box;
-      }
-      .status-title {
-        min-width: 0;
-        flex: 1;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      .status-progress {
-        flex-shrink: 0;
-        font-variant-numeric: tabular-nums;
-      }
-
-      /* 竖向滚动正文区 */
-      .reader-scroll {
-        flex: 1;
-        overflow-y: auto;
-        -webkit-overflow-scrolling: touch;
-        overscroll-behavior: contain;
-        touch-action: manipulation;
-      }
-      .reader-article {
-        max-width: 720px;
-        margin: 0 auto;
-        padding: calc(44px + env(safe-area-inset-top, 0px)) 20px calc(110px + env(safe-area-inset-bottom, 0px));
-        box-sizing: border-box;
-      }
-      .reader-chapter-title {
-        font-size: calc(var(--reader-font-size) + 4px);
-        line-height: 1.4;
-        font-weight: 700;
-        margin: 0 0 22px;
-        color: var(--hl-text);
-      }
-      .reader-p {
-        margin: 0 0 0.85em;
-        font-size: var(--reader-font-size);
-        line-height: var(--reader-line-height);
-        text-indent: 2em;
-        word-break: break-word;
-      }
-      .reader-sentence {
-        border-radius: 3px;
-        transition: background-color 0.2s, color 0.2s;
-      }
-      .reader-sentence.active {
-        background: var(--hl-bg);
-        color: var(--hl-text);
-        box-shadow: 0 0 0 2px var(--hl-bg);
-      }
-
-      /* 章节底部上下章翻页按钮 */
-      .reader-footer-nav {
-        display: flex;
-        gap: 12px;
-        margin-top: 32px;
-        padding-top: 20px;
-        border-top: 1px solid var(--border);
-      }
-      .footer-nav-btn {
-        flex: 1;
-        height: 44px;
-        border-radius: 10px;
-        border: 1px solid var(--border);
-        background: var(--btn-bg);
-        color: var(--text);
-        font-size: 14px;
-        font-weight: 500;
-        cursor: pointer;
-      }
-      .footer-nav-btn.primary {
-        border-color: var(--accent);
-        color: var(--accent);
-      }
-      .footer-nav-btn:disabled {
-        opacity: 0.35;
-        cursor: not-allowed;
-      }
-
-      /* 回到朗读处浮动胶囊 */
-      .relocate-btn {
-        position: fixed;
-        right: 16px;
-        bottom: calc(74px + env(safe-area-inset-bottom, 0px));
-        padding: 7px 12px;
-        border-radius: 18px;
-        border: 1px solid var(--accent);
-        background: var(--dock-bg);
-        color: var(--accent);
-        font-size: 12px;
-        font-weight: 500;
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
-        cursor: pointer;
-        opacity: 0;
-        pointer-events: none;
-        transform: translateY(8px);
-        transition: opacity 0.2s, transform 0.2s;
-        z-index: 4;
-      }
-      .relocate-btn.visible {
-        opacity: 1;
-        pointer-events: auto;
-        transform: translateY(0);
-      }
-
-      /* 迷你底部听书栏 (无正文文字预览，仅控播与进度) */
-      .mini-tts-bar {
-        position: fixed;
-        left: 12px;
-        right: 12px;
-        bottom: calc(10px + env(safe-area-inset-bottom, 0px));
-        height: 48px;
-        padding: 0 12px;
-        border-radius: 24px;
-        background: var(--dock-bg);
-        backdrop-filter: blur(16px);
-        -webkit-backdrop-filter: blur(16px);
-        border: 1px solid var(--border);
-        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.2);
-        display: none;
-        align-items: center;
-        justify-content: space-between;
-        gap: 8px;
-        z-index: 4;
-        box-sizing: border-box;
-      }
-      .mini-tts-bar.visible {
-        display: flex;
-      }
-      .mini-controls {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-      }
-      .mini-btn {
-        width: 34px;
-        height: 34px;
-        border-radius: 50%;
-        border: none;
-        background: var(--btn-bg);
-        color: var(--text);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        cursor: pointer;
-      }
-      .mini-btn.primary {
-        background: var(--accent);
-        color: #ffffff;
-      }
-      .mini-btn svg {
-        fill: currentColor;
-      }
-      .mini-progress {
-        font-size: 12px;
-        color: var(--muted);
-        font-variant-numeric: tabular-nums;
-      }
-
-      /* 仿夸克滑出顶栏 */
-      .top-bar {
-        position: fixed;
-        top: 0;
-        left: 0;
-        right: 0;
-        padding: calc(10px + env(safe-area-inset-top, 0px)) 14px 10px;
-        background: var(--dock-bg);
-        backdrop-filter: blur(18px);
-        -webkit-backdrop-filter: blur(18px);
-        border-bottom: 1px solid var(--border);
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 10px;
-        transform: translateY(-105%);
-        transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1);
-        z-index: 6;
-        box-sizing: border-box;
-      }
-      .top-bar.open {
-        transform: translateY(0);
-      }
-      .top-title {
-        flex: 1;
-        min-width: 0;
-        text-align: center;
-        font-size: 14px;
-        font-weight: 600;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      .bar-text-btn {
-        border: none;
-        background: none;
-        color: var(--text);
-        font-size: 13px;
-        padding: 5px 8px;
-        border-radius: 6px;
-        cursor: pointer;
-        flex-shrink: 0;
-      }
-      .bar-text-btn.accent {
-        color: var(--accent);
-        background: var(--btn-bg);
-        font-size: 12px;
-      }
-
-      /* 仿夸克滑出底栏 */
-      .bottom-dock {
-        position: fixed;
-        left: 0;
-        right: 0;
-        bottom: 0;
-        padding: 10px 14px calc(10px + env(safe-area-inset-bottom, 0px));
-        background: var(--dock-bg);
-        backdrop-filter: blur(18px);
-        -webkit-backdrop-filter: blur(18px);
-        border-top: 1px solid var(--border);
-        box-shadow: 0 -8px 28px rgba(0, 0, 0, 0.18);
-        transform: translateY(105%);
-        transition: transform 0.24s cubic-bezier(0.16, 1, 0.3, 1);
-        z-index: 6;
-        box-sizing: border-box;
-      }
-      .bottom-dock.open {
-        transform: translateY(0);
-      }
-
-      .subpanel {
-        display: none;
-        padding-bottom: 12px;
-        margin-bottom: 10px;
-        border-bottom: 1px solid var(--border);
-      }
-      .subpanel.open {
-        display: block;
-      }
-
-      /* 排版设置行 */
-      .setting-row {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 10px;
-        margin-bottom: 10px;
-      }
-      .setting-row:last-child {
-        margin-bottom: 0;
-      }
-      .setting-label {
-        font-size: 12px;
-        color: var(--muted);
-        flex-shrink: 0;
-      }
-      .btn-group {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        flex: 1;
-        justify-content: flex-end;
-      }
-      .pill-btn {
-        border: 1px solid var(--border);
-        background: var(--btn-bg);
-        color: var(--text);
-        font-size: 12px;
-        padding: 5px 12px;
-        border-radius: 14px;
-        cursor: pointer;
-      }
-      .pill-btn.active {
-        border-color: var(--accent);
-        color: var(--accent);
-        font-weight: 600;
-      }
-      .font-val {
-        font-size: 13px;
-        min-width: 40px;
-        text-align: center;
-        font-variant-numeric: tabular-nums;
-      }
-      .theme-swatch {
-        display: inline-flex;
-        align-items: center;
-        gap: 5px;
-        padding: 5px 9px;
-        border-radius: 12px;
-        border: 1px solid var(--border);
-        background: var(--btn-bg);
-        color: var(--text);
-        font-size: 11px;
-        cursor: pointer;
-      }
-      .theme-swatch.active {
-        border-color: var(--accent);
-        color: var(--accent);
-        font-weight: 600;
-      }
-      .swatch-dot {
-        width: 12px;
-        height: 12px;
-        border-radius: 50%;
-        border: 1px solid rgba(128, 128, 128, 0.35);
-      }
-      .switch-label {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 12px;
-        color: var(--text);
-        cursor: pointer;
-      }
-
-      /* 听书设置子面板 (无正文预览框) */
-      .tts-info-row {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        font-size: 12px;
-        color: var(--muted);
-        margin-bottom: 10px;
-      }
-      .tts-controls-row {
-        display: flex;
-        align-items: center;
-        justify-content: space-around;
-        margin-bottom: 10px;
-      }
-      .tts-btn {
-        width: 40px;
-        height: 40px;
-        border-radius: 50%;
-        border: none;
-        background: var(--btn-bg);
-        color: var(--text);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        cursor: pointer;
-      }
-      .tts-btn.primary {
-        width: 50px;
-        height: 50px;
-        background: var(--accent);
-        color: #ffffff;
-      }
-      .tts-btn svg {
-        fill: currentColor;
-      }
-      .tts-params-row {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 8px;
-      }
-      .voice-select {
-        background: var(--btn-bg);
-        border: 1px solid var(--border);
-        color: var(--text);
-        font-size: 12px;
-        padding: 5px 8px;
-        border-radius: 8px;
-        outline: none;
-        max-width: 135px;
-      }
-      .voice-select option {
-        background: var(--surface);
-        color: var(--text);
-      }
-
-      /* Worker 配置子面板 */
-      .field {
-        margin-bottom: 8px;
-      }
-      .field label {
-        display: block;
-        font-size: 11px;
-        color: var(--muted);
-        margin-bottom: 4px;
-      }
-      .field input {
-        width: 100%;
-        box-sizing: border-box;
-        background: var(--btn-bg);
-        border: 1px solid var(--border);
-        border-radius: 6px;
-        padding: 6px 10px;
-        color: var(--text);
-        font-size: 12px;
-        outline: none;
-      }
-      .worker-btn-row {
-        display: flex;
-        gap: 8px;
-      }
-      .save-btn {
-        flex: 1;
-        background: var(--accent);
-        color: #ffffff;
-        border: none;
-        padding: 7px;
-        border-radius: 6px;
-        font-size: 12px;
-        font-weight: 500;
-        cursor: pointer;
-      }
-      .test-btn {
-        flex: 1;
-        background: var(--btn-bg);
-        color: var(--accent);
-        border: 1px solid var(--accent);
-        padding: 7px;
-        border-radius: 6px;
-        font-size: 12px;
-        font-weight: 500;
-        cursor: pointer;
-      }
-      .test-result {
-        display: none;
-        margin-top: 8px;
-        padding: 6px 10px;
-        border-radius: 6px;
-        font-size: 11px;
-        line-height: 1.4;
-      }
-      .test-result.success {
-        display: block;
-        background: rgba(34, 197, 94, 0.15);
-        border: 1px solid rgba(34, 197, 94, 0.35);
-        color: #16a34a;
-      }
-      .test-result.error {
-        display: block;
-        background: rgba(239, 68, 68, 0.15);
-        border: 1px solid rgba(239, 68, 68, 0.35);
-        color: #dc2626;
-      }
-
-      /* 底层 4 键主操作栏 */
-      .dock-actions {
-        display: grid;
-        grid-template-columns: repeat(4, 1fr);
-        gap: 6px;
-      }
-      .dock-btn {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        gap: 2px;
-        padding: 6px 4px;
-        border: none;
-        border-radius: 8px;
-        background: none;
-        color: var(--text);
-        font-size: 11px;
-        cursor: pointer;
-      }
-      .dock-btn.active,
-      .dock-btn.is-playing {
-        color: var(--accent);
-        font-weight: 600;
-      }
-      .dock-btn:disabled {
-        opacity: 0.35;
-        cursor: not-allowed;
-      }
-    `;
+    style.textContent = READER_STYLES;
 
     const lineHeightButtonsHtml = LINE_HEIGHT_PRESETS.map(
       (p) =>
@@ -1066,11 +927,16 @@ export class ReaderView {
 
       <div class="reader-scroll" id="rv-scroll">
         <article class="reader-article">
-          <h1 class="reader-chapter-title" id="rv-article-title"></h1>
-          <div class="reader-body" id="rv-article-body"></div>
-          <div class="reader-footer-nav">
-            <button class="footer-nav-btn" id="rv-footer-prev">上一章</button>
-            <button class="footer-nav-btn primary" id="rv-footer-next">下一章</button>
+          <div class="top-prev-wrap">
+            <button class="top-prev-btn" id="rv-top-prev">↑ 上一章</button>
+          </div>
+          <div id="rv-chapters-root"></div>
+          <div class="reader-tail-bar" id="rv-tail-bar">
+            <div class="tail-status-text" id="rv-tail-status"></div>
+            <div class="reader-footer-nav">
+              <button class="footer-nav-btn" id="rv-footer-prev">上一章</button>
+              <button class="footer-nav-btn primary" id="rv-footer-next">下一章</button>
+            </div>
           </div>
         </article>
       </div>
@@ -1121,7 +987,14 @@ export class ReaderView {
             <div class="btn-group">${themeButtonsHtml}</div>
           </div>
           <div class="setting-row">
-            <span class="setting-label">偏好</span>
+            <span class="setting-label">连读</span>
+            <label class="switch-label">
+              <input type="checkbox" id="rv-infinite-scroll" />
+              <span>下滑自动无缝加载下一章</span>
+            </label>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">启动</span>
             <label class="switch-label">
               <input type="checkbox" id="rv-auto-enter" />
               <span>打开小说页自动进入阅读模式</span>
@@ -1171,13 +1044,32 @@ export class ReaderView {
           <div class="test-result" id="rv-test-result"></div>
         </div>
 
+        <!-- 布局 2：仿夸克 4 键底栏 -->
         <div class="dock-actions">
-          <button class="dock-btn" id="rv-dock-prev-ch">上一章</button>
+          <button class="dock-btn" id="rv-dock-toc">目录</button>
           <button class="dock-btn" id="rv-dock-tts">听书</button>
           <button class="dock-btn" id="rv-dock-appearance">设置</button>
           <button class="dock-btn" id="rv-dock-next-ch">下一章</button>
         </div>
       </div>
+
+      <!-- 左侧目录抽屉 -->
+      <div class="toc-backdrop" id="rv-toc-backdrop"></div>
+      <aside class="toc-drawer" id="rv-toc-drawer">
+        <div class="toc-header">
+          <span class="toc-book-title" id="rv-toc-book-title">小说目录</span>
+          <button class="bar-text-btn" id="rv-toc-close">✕</button>
+        </div>
+        <div class="toc-tools">
+          <input type="text" class="toc-search" id="rv-toc-search" placeholder="搜索章节标题…" />
+          <button class="pill-btn" id="rv-toc-sort">倒序</button>
+        </div>
+        <div class="toc-list" id="rv-toc-list"></div>
+        <div class="toc-footer">
+          <button class="pill-btn" id="rv-toc-refresh">刷新目录</button>
+          <button class="pill-btn" id="rv-toc-external">原站目录</button>
+        </div>
+      </aside>
     `;
 
     this.shadow.appendChild(style);
@@ -1187,8 +1079,9 @@ export class ReaderView {
     this.scrollEl = this.shadow.querySelector('#rv-scroll')!;
     this.statusTitleEl = this.shadow.querySelector('#rv-status-title')!;
     this.statusProgressEl = this.shadow.querySelector('#rv-status-progress')!;
-    this.articleTitleEl = this.shadow.querySelector('#rv-article-title')!;
-    this.articleBodyEl = this.shadow.querySelector('#rv-article-body')!;
+    this.topPrevBtn = this.shadow.querySelector('#rv-top-prev')!;
+    this.chaptersRootEl = this.shadow.querySelector('#rv-chapters-root')!;
+    this.tailStatusEl = this.shadow.querySelector('#rv-tail-status')!;
     this.footerPrevBtn = this.shadow.querySelector('#rv-footer-prev')!;
     this.footerNextBtn = this.shadow.querySelector('#rv-footer-next')!;
     this.relocateBtn = this.shadow.querySelector('#rv-relocate')!;
@@ -1209,6 +1102,7 @@ export class ReaderView {
 
     this.fontValEl = this.shadow.querySelector('#rv-font-val')!;
     this.autoEnterInput = this.shadow.querySelector('#rv-auto-enter')!;
+    this.infiniteScrollInput = this.shadow.querySelector('#rv-infinite-scroll')!;
 
     this.ttsProgressEl = this.shadow.querySelector('#rv-tts-progress')!;
     this.ttsPlayBtn = this.shadow.querySelector('#rv-tts-play')!;
@@ -1221,10 +1115,19 @@ export class ReaderView {
     this.testBtn = this.shadow.querySelector('#rv-test-config')!;
     this.testResultEl = this.shadow.querySelector('#rv-test-result')!;
 
-    this.dockPrevChBtn = this.shadow.querySelector('#rv-dock-prev-ch')!;
+    this.dockTocBtn = this.shadow.querySelector('#rv-dock-toc')!;
     this.dockTtsBtn = this.shadow.querySelector('#rv-dock-tts')!;
     this.dockAppearanceBtn = this.shadow.querySelector('#rv-dock-appearance')!;
     this.dockNextChBtn = this.shadow.querySelector('#rv-dock-next-ch')!;
+
+    this.tocBackdropEl = this.shadow.querySelector('#rv-toc-backdrop')!;
+    this.tocDrawerEl = this.shadow.querySelector('#rv-toc-drawer')!;
+    this.tocBookTitleEl = this.shadow.querySelector('#rv-toc-book-title')!;
+    this.tocSearchInput = this.shadow.querySelector('#rv-toc-search')!;
+    this.tocSortBtn = this.shadow.querySelector('#rv-toc-sort')!;
+    this.tocListEl = this.shadow.querySelector('#rv-toc-list')!;
+    this.tocRefreshBtn = this.shadow.querySelector('#rv-toc-refresh')!;
+    this.tocExternalBtn = this.shadow.querySelector('#rv-toc-external')!;
 
     this.workerInput.value = config.workerUrl;
     this.tokenInput.value = config.token;
@@ -1234,7 +1137,6 @@ export class ReaderView {
   // ─── 事件绑定 ──────────────────────────────────────────────────────────
 
   private bindEvents(): void {
-    // 滚动监听与手动滑动保护
     const markUserScroll = () => {
       this.lastUserScrollAt = Date.now();
     };
@@ -1244,8 +1146,10 @@ export class ReaderView {
       if (Date.now() > this.programmaticScrollUntil) {
         this.lastUserScrollAt = Date.now();
       }
+      this.updateVisibleChapterFromScroll();
       this.updateScrollStatus();
       this.updateRelocateVisibility();
+      this.maybeTriggerInfiniteAppend();
     });
 
     // 正文区滑动 vs 单击切菜单 vs 双击句起播
@@ -1301,7 +1205,10 @@ export class ReaderView {
       }
 
       const target = e.target as HTMLElement | null;
-      if (!target || target.closest('.reader-footer-nav, button, a, input, select')) {
+      if (
+        !target ||
+        target.closest('.reader-tail-bar, .top-prev-wrap, button, a, input, select')
+      ) {
         return;
       }
 
@@ -1318,25 +1225,32 @@ export class ReaderView {
         return;
       }
 
+      const chapterId = sentenceEl.getAttribute('data-chapter-id') || '';
       const chunkIdx = Number.parseInt(sentenceEl.getAttribute('data-chunk-index') || '', 10);
-      if (!Number.isFinite(chunkIdx) || chunkIdx < 0) {
+      if (!chapterId || !Number.isFinite(chunkIdx) || chunkIdx < 0) {
         this.setMenuOpen(true);
         return;
       }
 
       const now = Date.now();
-      if (this.lastTapChunkIdx === chunkIdx && now - this.lastTapAt <= 320) {
-        // 双击同一句：同步清掉菜单定时器并立即触发起播（保留 iOS Safari 用户激活栈）
+      if (
+        this.lastTapChapterId === chapterId &&
+        this.lastTapChunkIdx === chunkIdx &&
+        now - this.lastTapAt <= 320
+      ) {
+        // 双击同一章同一句：同步触发起播（保留 iOS Safari 用户激活栈）
         this.clearSingleTapTimer();
-        this.events.onSeekSentence(chunkIdx);
+        this.events.onSeekSentence(chapterId, chunkIdx);
         return;
       }
 
       this.clearSingleTapTimer();
+      this.lastTapChapterId = chapterId;
       this.lastTapChunkIdx = chunkIdx;
       this.lastTapAt = now;
       this.singleTapTimer = setTimeout(() => {
         this.singleTapTimer = null;
+        this.lastTapChapterId = '';
         this.lastTapChunkIdx = -1;
         if (this.opened && !this.isMenuOpen) {
           this.setMenuOpen(true);
@@ -1347,9 +1261,7 @@ export class ReaderView {
     // 回到朗读处
     this.relocateBtn.addEventListener('click', () => {
       this.lastUserScrollAt = 0;
-      const activeEl = this.articleBodyEl.querySelector(
-        `.reader-sentence[data-chunk-index="${this.activeChunkIndex}"]`
-      ) as HTMLElement | null;
+      const activeEl = this.findFirstActiveSentenceEl();
       if (activeEl) {
         this.scrollToSentenceEl(activeEl);
       }
@@ -1361,8 +1273,10 @@ export class ReaderView {
       this.events.onClose();
     });
     this.jumpBtn.addEventListener('click', () => {
-      if (this.currentChapterUrl) {
-        this.events.onJumpChapterUrl(this.currentChapterUrl);
+      const visible =
+        this.chapters.find((c) => c.id === this.visibleChapterId) || this.chapters[0];
+      if (visible?.url) {
+        this.events.onJumpChapterUrl(visible.url);
       }
     });
     this.shadow.querySelector('#rv-top-worker')!.addEventListener('click', () => {
@@ -1383,7 +1297,7 @@ export class ReaderView {
       this.setMenuOpen(true, 'tts');
     });
 
-    // 排版设置
+    // 排版与阅读设置
     this.shadow.querySelector('#rv-font-dec')!.addEventListener('click', () => {
       this.updateSettings({ fontSize: Math.max(14, this.settings.fontSize - 2) });
     });
@@ -1408,6 +1322,9 @@ export class ReaderView {
     });
     this.autoEnterInput.addEventListener('change', () => {
       this.updateSettings({ autoEnter: this.autoEnterInput.checked });
+    });
+    this.infiniteScrollInput.addEventListener('change', () => {
+      this.updateSettings({ infiniteScroll: this.infiniteScrollInput.checked });
     });
 
     // 听书子面板控制
@@ -1455,22 +1372,47 @@ export class ReaderView {
       });
     });
 
-    // 底层 4 键主栏与章节底部翻页
+    // 章首/章尾翻页
+    this.topPrevBtn.addEventListener('click', () => this.events.onPrevChapter());
     this.footerPrevBtn.addEventListener('click', () => this.events.onPrevChapter());
     this.footerNextBtn.addEventListener('click', () => this.events.onNextChapter());
-    this.dockPrevChBtn.addEventListener('click', () => {
-      this.setMenuOpen(false);
-      this.events.onPrevChapter();
-    });
-    this.dockNextChBtn.addEventListener('click', () => {
-      this.setMenuOpen(false);
-      this.events.onNextChapter();
+
+    // 布局 2：仿夸克 4 键底栏
+    this.dockTocBtn.addEventListener('click', () => {
+      this.openTocDrawer();
     });
     this.dockTtsBtn.addEventListener('click', () => {
       this.setSubpanel(this.activeSubpanel === 'tts' ? 'none' : 'tts');
     });
     this.dockAppearanceBtn.addEventListener('click', () => {
       this.setSubpanel(this.activeSubpanel === 'appearance' ? 'none' : 'appearance');
+    });
+    this.dockNextChBtn.addEventListener('click', () => {
+      this.setMenuOpen(false);
+      this.events.onNextChapter();
+    });
+
+    // 目录抽屉控制
+    this.tocBackdropEl.addEventListener('click', () => this.closeTocDrawer());
+    this.shadow.querySelector('#rv-toc-close')!.addEventListener('click', () => {
+      this.closeTocDrawer();
+    });
+    this.tocSearchInput.addEventListener('input', () => {
+      this.tocSearchQuery = this.tocSearchInput.value;
+      this.renderTocList();
+    });
+    this.tocSortBtn.addEventListener('click', () => {
+      this.tocSortDesc = !this.tocSortDesc;
+      this.tocSortBtn.textContent = this.tocSortDesc ? '正序' : '倒序';
+      this.renderTocList();
+    });
+    this.tocRefreshBtn.addEventListener('click', () => {
+      this.events.onRefreshToc();
+    });
+    this.tocExternalBtn.addEventListener('click', () => {
+      if (this.tocState.tocUrl) {
+        this.events.onOpenExternalToc(this.tocState.tocUrl);
+      }
     });
   }
 }

@@ -1,5 +1,13 @@
 import { Readability } from '@mozilla/readability';
 import type { ChapterContent } from './tts/types';
+import {
+  cleanLine,
+  cleanTitle,
+  extractTocUrl,
+  extractTocFromDocument,
+} from './tocExtractor';
+
+export { cleanLine, cleanTitle, extractTocUrl, extractTocFromDocument };
 
 /** 常见小说站正文容器的启发式选择器（按优先级排序） */
 const NOVEL_CONTENT_SELECTORS = [
@@ -87,28 +95,6 @@ const NOISE_TAGS = new Set([
 
 /** 兜底正文识别的最小字数阈值，低于此值不视为有效正文 */
 const MIN_CONTENT_CHAR_THRESHOLD = 30;
-
-/**
- * 清洗单行文本中的不可见字符与冗余空白
- */
-export function cleanLine(raw: string): string {
-  return raw
-    .replace(/[\u200B-\u200D\uFEFF]/g, '') // 零宽字符
-    .replace(/[\u00A0\u3000]/g, ' ')      // 不换行空格与全角空格转半角空格
-    .replace(/[ \t\f\r]+/g, ' ')          // 合并连续水平空白
-    .trim();
-}
-
-/**
- * 清洗标题，去除诸如 " - 笔趣阁", " _ 顶点小说", " | 小说网" 等网站后缀
- */
-export function cleanTitle(raw: string): string {
-  const line = cleanLine(raw);
-  return line
-    .replace(/[-_|(][^-_|(]*?(?:小说|网|阁|看书|中文|免费|书院|首发|章节).*$/i, '')
-    .replace(/\s*[-_|]\s*[^- _|]+$/, '')
-    .trim() || line;
-}
 
 /**
  * 将整段文本清洗并切分为非空段落数组
@@ -419,6 +405,7 @@ export function extractPrevChapterUrl(doc: Document, currentUrl?: string): strin
 export function extractChapterContent(doc: Document, currentUrl?: string): ChapterContent {
   const nextChapterUrl = extractNextChapterUrl(doc, currentUrl);
   const prevChapterUrl = extractPrevChapterUrl(doc, currentUrl);
+  const tocUrl = extractTocUrl(doc, currentUrl);
 
   let title = '';
   let paragraphs: string[] = [];
@@ -479,5 +466,6 @@ export function extractChapterContent(doc: Document, currentUrl?: string): Chapt
     paragraphs,
     nextChapterUrl,
     prevChapterUrl,
+    tocUrl,
   };
 }

@@ -1,5 +1,6 @@
 import { extractChapterContent } from './extractor';
-import type { ChapterContent } from './tts/types';
+import { extractTocFromDocument } from './tocExtractor';
+import type { ChapterContent, TocData } from './tts/types';
 
 /**
  * 探测 HTML ArrayBuffer 的字符编码（支持 UTF-8 / GBK / GB2312 / GB18030）
@@ -288,27 +289,7 @@ export class ChapterLoader {
     });
   }
 
-  /**
-   * 静默拉取指定章节的 HTML 并解析正文
-   * @param targetUrl 下一章完整 URL
-   * @param options 加载选项（allowVisited 为 true 时允许重读已访问章节，如手动上一章）
-   */
-  async loadChapter(
-    targetUrl: string,
-    options?: { allowVisited?: boolean }
-  ): Promise<ChapterContent | null> {
-    const normalized = this.normalizeUrl(targetUrl);
-    if (!normalized) {
-      console.warn('[NovelTTS] Invalid chapter URL:', targetUrl);
-      return null;
-    }
-
-    // 防死循环判断（自动连播始终拦截，手动翻页可传 allowVisited 放行）
-    if (!options?.allowVisited && this.visitedUrls.has(normalized)) {
-      console.warn('[NovelTTS] Prevented loop: already visited URL:', normalized);
-      return null;
-    }
-
+  private async fetchHtml(targetUrl: string): Promise<string> {
     let html: string | null = null;
     let nativeFetchError: Error | null = null;
 
@@ -330,6 +311,32 @@ export class ChapterLoader {
       html = await this.fetchChapterViaGM(targetUrl);
     }
 
+    return html;
+  }
+
+  /**
+   * 静默拉取指定章节的 HTML 并解析正文
+   * @param targetUrl 下一章完整 URL
+   * @param options 加载选项（allowVisited 为 true 时允许重读已访问章节，如手动上一章）
+   */
+  async loadChapter(
+    targetUrl: string,
+    options?: { allowVisited?: boolean }
+  ): Promise<ChapterContent | null> {
+    const normalized = this.normalizeUrl(targetUrl);
+    if (!normalized) {
+      console.warn('[NovelTTS] Invalid chapter URL:', targetUrl);
+      return null;
+    }
+
+    // 防死循环判断（自动连播始终拦截，手动翻页可传 allowVisited 放行）
+    if (!options?.allowVisited && this.visitedUrls.has(normalized)) {
+      console.warn('[NovelTTS] Prevented loop: already visited URL:', normalized);
+      return null;
+    }
+
+    const html = await this.fetchHtml(targetUrl);
+
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, 'text/html');
 
@@ -342,5 +349,20 @@ export class ChapterLoader {
     }
 
     return content;
+  }
+
+  /**
+   * 静默拉取小说目录页并解析章节列表（不写入 visitedUrls，避免污染正文防环）
+   */
+  async loadToc(tocUrl: string): Promise<TocData> {
+    const normalized = this.normalizeUrl(tocUrl);
+    if (!normalized) {
+      throw new Error(`非法的目录地址: ${tocUrl}`);
+    }
+
+    const html = await this.fetchHtml(tocUrl);
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    return extractTocFromDocument(doc, tocUrl);
   }
 }

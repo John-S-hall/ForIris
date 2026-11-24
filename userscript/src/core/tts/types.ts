@@ -3,6 +3,19 @@ export interface ChapterContent {
   paragraphs: string[];
   nextChapterUrl: string | null;
   prevChapterUrl?: string | null;
+  tocUrl?: string | null;
+}
+
+export interface TocItem {
+  title: string;
+  url: string;
+}
+
+export interface TocData {
+  tocUrl: string;
+  bookTitle: string;
+  items: TocItem[];
+  nextPageUrl: string | null;
 }
 
 export interface TTSOptions {

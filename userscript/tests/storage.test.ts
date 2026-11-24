@@ -92,13 +92,14 @@ describe('storage.ts - 跨站配置持久化与降级存储', () => {
     expect(compat.reader).toEqual(DEFAULT_READER_SETTINGS);
 
     // 部分更新阅读模式偏好不影响其他字段
-    ConfigStorage.saveReaderSettings({ theme: 'dark', fontSize: 22 });
+    ConfigStorage.saveReaderSettings({ theme: 'dark', fontSize: 22, infiniteScroll: false });
     const updated = ConfigStorage.load();
     expect(updated.reader).toEqual({
       theme: 'dark',
       fontSize: 22,
       lineHeight: DEFAULT_READER_SETTINGS.lineHeight,
       autoEnter: false,
+      infiniteScroll: false,
     });
     expect(updated.workerUrl).toBe('https://worker.example.com');
 
@@ -108,6 +109,7 @@ describe('storage.ts - 跨站配置持久化与降级存储', () => {
       fontSize: 99,
       lineHeight: 0.5,
       autoEnter: true,
+      infiniteScroll: true,
     });
     const clamped = ConfigStorage.load();
     expect(clamped.reader).toEqual({
@@ -115,6 +117,7 @@ describe('storage.ts - 跨站配置持久化与降级存储', () => {
       fontSize: 28,
       lineHeight: 1.4,
       autoEnter: true,
+      infiniteScroll: true,
     });
   });
 });

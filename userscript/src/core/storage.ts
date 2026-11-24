@@ -5,6 +5,7 @@ export interface ReaderSettings {
   fontSize: number; // 14 ~ 28，默认 18
   lineHeight: number; // 1.4 ~ 2.4，默认 1.85
   autoEnter: boolean; // 默认 false
+  infiniteScroll: boolean; // 下滑自动拼接下一章，默认 true
 }
 
 export const DEFAULT_READER_SETTINGS: ReaderSettings = {
@@ -12,6 +13,7 @@ export const DEFAULT_READER_SETTINGS: ReaderSettings = {
   fontSize: 18,
   lineHeight: 1.85,
   autoEnter: false,
+  infiniteScroll: true,
 };
 
 const VALID_THEMES = new Set<ReaderTheme>(['light', 'sepia', 'green', 'dark']);
@@ -59,8 +61,12 @@ function normalizeReaderSettings(raw?: Partial<ReaderSettings> | null): ReaderSe
 
   const autoEnter =
     typeof src.autoEnter === 'boolean' ? src.autoEnter : DEFAULT_READER_SETTINGS.autoEnter;
+  const infiniteScroll =
+    typeof src.infiniteScroll === 'boolean'
+      ? src.infiniteScroll
+      : DEFAULT_READER_SETTINGS.infiniteScroll;
 
-  return { theme, fontSize, lineHeight, autoEnter };
+  return { theme, fontSize, lineHeight, autoEnter, infiniteScroll };
 }
 
 /**
