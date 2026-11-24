@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { chunkText } from '../src/core/chunker';
+import { chunkText, chunkParagraphs } from '../src/core/chunker';
 
 describe('chunker.ts - 标点切分与句子合并引擎', () => {
   it('应当正常按常见标点（。！？；）切分句子', () => {
@@ -69,5 +69,26 @@ describe('chunker.ts - 标点切分与句子合并引擎', () => {
     expect(chunkText([])).toEqual([]);
     expect(chunkText('！！！？？？。。。。')).toEqual([]);
     expect(chunkText(['   ', '，，，', '。'])).toEqual([]);
+  });
+
+  it('chunkParagraphs：输出文本与 chunkText 严格一致，并精准保留跨段合并与长段切分的段落索引', () => {
+    const paragraphs = [
+      '“谁？”',
+      '“是我。”',
+      '屋内的少年闻言松了一口气，伸手轻轻拉开了木门。',
+      '这是一段超过一百二十字的极长单段落描写内容。他站在山巅之上迎风远眺，只见群山连绵起伏宛如沧海波涛般望不到尽头，漫天晚霞染红了半边苍穹。风吹衣袂猎猎作响，远方天际隐隐约约浮现出一道金色虹光直冲云霄！',
+    ];
+    const structured = chunkParagraphs(paragraphs, { minChars: 30, maxChars: 120 });
+    const plain = chunkText(paragraphs, { minChars: 30, maxChars: 120 });
+
+    expect(structured.map((c) => c.text)).toEqual(plain);
+    expect(structured[0].index).toBe(0);
+    // 第 0 句跨段合并了 0, 1, 2 三段
+    expect(structured[0].segments.map((s) => s.paragraphIndex)).toEqual([0, 1, 2]);
+    // 第 4 段自身被切分为多个句片段，每个都指向 paragraphIndex === 3
+    const lastSegParagraphs = structured[structured.length - 1].segments.map(
+      (s) => s.paragraphIndex
+    );
+    expect(lastSegParagraphs.every((idx) => idx === 3)).toBe(true);
   });
 });

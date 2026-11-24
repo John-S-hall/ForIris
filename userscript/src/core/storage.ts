@@ -1,3 +1,21 @@
+export type ReaderTheme = 'light' | 'sepia' | 'green' | 'dark';
+
+export interface ReaderSettings {
+  theme: ReaderTheme;
+  fontSize: number; // 14 ~ 28，默认 18
+  lineHeight: number; // 1.4 ~ 2.4，默认 1.85
+  autoEnter: boolean; // 默认 false
+}
+
+export const DEFAULT_READER_SETTINGS: ReaderSettings = {
+  theme: 'sepia',
+  fontSize: 18,
+  lineHeight: 1.85,
+  autoEnter: false,
+};
+
+const VALID_THEMES = new Set<ReaderTheme>(['light', 'sepia', 'green', 'dark']);
+
 export interface BallPosition {
   side: 'left' | 'right';
   offsetTop: number;
@@ -9,6 +27,7 @@ export interface AppConfig {
   voice: string;
   rate: number;
   ballPosition?: BallPosition;
+  reader: ReaderSettings;
 }
 
 export const DEFAULT_CONFIG: AppConfig = {
@@ -16,9 +35,33 @@ export const DEFAULT_CONFIG: AppConfig = {
   token: 'dev-secret',
   voice: 'zh-CN-XiaoxiaoNeural',
   rate: 1.0,
+  reader: { ...DEFAULT_READER_SETTINGS },
 };
 
 const STORAGE_KEY = 'novel_tts_config';
+
+function normalizeReaderSettings(raw?: Partial<ReaderSettings> | null): ReaderSettings {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const theme: ReaderTheme =
+    src.theme && VALID_THEMES.has(src.theme as ReaderTheme)
+      ? (src.theme as ReaderTheme)
+      : DEFAULT_READER_SETTINGS.theme;
+
+  const fontSize =
+    typeof src.fontSize === 'number' && Number.isFinite(src.fontSize)
+      ? Math.max(14, Math.min(28, Math.round(src.fontSize)))
+      : DEFAULT_READER_SETTINGS.fontSize;
+
+  const lineHeight =
+    typeof src.lineHeight === 'number' && Number.isFinite(src.lineHeight)
+      ? Math.max(1.4, Math.min(2.4, Number(src.lineHeight.toFixed(2))))
+      : DEFAULT_READER_SETTINGS.lineHeight;
+
+  const autoEnter =
+    typeof src.autoEnter === 'boolean' ? src.autoEnter : DEFAULT_READER_SETTINGS.autoEnter;
+
+  return { theme, fontSize, lineHeight, autoEnter };
+}
 
 /**
  * 跨站配置持久化存储类
@@ -30,7 +73,11 @@ export class ConfigStorage {
   }
 
   private static normalizeConfig(parsed: Partial<AppConfig>): AppConfig {
-    const merged: AppConfig = { ...DEFAULT_CONFIG, ...parsed };
+    const merged: AppConfig = {
+      ...DEFAULT_CONFIG,
+      ...parsed,
+      reader: normalizeReaderSettings(parsed.reader),
+    };
     if (typeof merged.token !== 'string' || merged.token.trim().length === 0) {
       merged.token = DEFAULT_CONFIG.token;
     }
@@ -64,12 +111,19 @@ export class ConfigStorage {
     } catch {
       // JSON 解析或存储读取失败时使用默认值
     }
-    return { ...DEFAULT_CONFIG };
+    return {
+      ...DEFAULT_CONFIG,
+      reader: { ...DEFAULT_READER_SETTINGS },
+    };
   }
 
   static save(patch: Partial<AppConfig>): AppConfig {
     const current = this.load();
-    const updated = this.normalizeConfig({ ...current, ...patch });
+    const updated = this.normalizeConfig({
+      ...current,
+      ...patch,
+      reader: patch.reader ? { ...current.reader, ...patch.reader } : current.reader,
+    });
 
     try {
       const serialized = JSON.stringify(updated);
@@ -83,5 +137,15 @@ export class ConfigStorage {
     }
 
     return updated;
+  }
+
+  static saveReaderSettings(patch: Partial<ReaderSettings>): AppConfig {
+    const current = this.load();
+    return this.save({
+      reader: {
+        ...current.reader,
+        ...patch,
+      },
+    });
   }
 }

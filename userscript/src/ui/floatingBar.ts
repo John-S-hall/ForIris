@@ -1,12 +1,20 @@
 import type { AppConfig, BallPosition } from '../core/storage';
 import type { PlayerState } from '../core/tts/types';
 import type { ConnectionTestResult } from '../core/tts/edgeWorker';
+import {
+  SVG_PAUSE_PATH,
+  SVG_PLAY_PATH,
+  buildVoiceOptionsHtml,
+  executeConnectionTest,
+  getNextRate,
+} from './sharedControls';
 
 export interface FloatingBarEvents {
   onPlayToggle: () => void;
   onNextSentence: () => void;
   onPrevSentence: () => void;
   onNextChapter: () => void;
+  onOpenReader: () => void;
   onRateChange: (rate: number) => void;
   onVoiceChange: (voice: string) => void;
   onSaveConfig: (workerUrl: string, token: string) => void;
@@ -22,6 +30,7 @@ export class FloatingBar {
 
   // 状态引用
   private isSettingsOpen = false;
+  private isSuppressed = false;
   private playerState: PlayerState = 'idle';
   private currentChapterUrl: string | null = null;
   private currentRate = 1.0;
@@ -33,7 +42,6 @@ export class FloatingBar {
   private playBtn!: HTMLElement;
   private titleEl!: HTMLElement;
   private progressEl!: HTMLElement;
-  private textEl!: HTMLElement;
   private rateBtn!: HTMLElement;
   private voiceSelect!: HTMLSelectElement;
   private toastEl!: HTMLElement;
@@ -126,6 +134,19 @@ export class FloatingBar {
     }
   }
 
+  /** 阅读模式开启时抑制悬浮球与底栏面板，仅保留 Toast 提示 */
+  setSuppressed(suppressed: boolean): void {
+    this.isSuppressed = suppressed;
+    if (suppressed) {
+      this.panelEl.classList.remove('open');
+      this.ballEl.style.display = 'none';
+      this.panelEl.style.display = 'none';
+    } else {
+      this.panelEl.style.display = '';
+      this.ballEl.style.display = 'flex';
+    }
+  }
+
   // ─── 状态更新接口 ──────────────────────────────────────────────────────
 
   updatePlayerState(state: PlayerState): void {
@@ -134,9 +155,17 @@ export class FloatingBar {
     this.updateBallAnimation();
   }
 
-  updateProgress(index: number, total: number, sentence: string): void {
+  updateProgress(index: number, total: number, _sentence?: string): void {
     this.progressEl.textContent = `${index + 1} / ${total}`;
-    this.textEl.textContent = sentence || '正在准备朗读…';
+  }
+
+  syncRate(rate: number): void {
+    this.currentRate = rate;
+    this.rateBtn.textContent = `${rate.toFixed(1)}x`;
+  }
+
+  syncVoice(voice: string): void {
+    this.voiceSelect.value = voice;
   }
 
   updateChapter(title: string, currentUrl?: string): void {
@@ -248,12 +277,15 @@ export class FloatingBar {
         display: flex;
         justify-content: space-between;
         align-items: center;
-        margin-bottom: 6px;
+        gap: 8px;
+        margin-bottom: 12px;
       }
       .title-box {
         display: flex;
         align-items: center;
         gap: 8px;
+        min-width: 0;
+        flex: 1;
         overflow: hidden;
       }
       .title {
@@ -263,10 +295,10 @@ export class FloatingBar {
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-        max-width: 220px;
       }
       .jump-btn {
         display: none;
+        flex-shrink: 0;
         font-size: 11px;
         padding: 2px 6px;
         background: rgba(56, 189, 248, 0.2);
@@ -278,7 +310,25 @@ export class FloatingBar {
       .actions-box {
         display: flex;
         align-items: center;
-        gap: 10px;
+        flex-shrink: 0;
+        gap: 8px;
+      }
+      .reader-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        background: rgba(56, 189, 248, 0.16);
+        border: 1px solid rgba(56, 189, 248, 0.35);
+        color: #38bdf8;
+        font-size: 11px;
+        font-weight: 500;
+        padding: 3px 8px;
+        border-radius: 10px;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      .reader-pill:active {
+        background: rgba(56, 189, 248, 0.28);
       }
       .icon-btn {
         background: none;
@@ -299,27 +349,6 @@ export class FloatingBar {
         padding: 2px 7px;
         border-radius: 10px;
         color: #94a3b8;
-      }
-
-      /* 当前朗读句预览 (外层负责 padding，内层精准 2 行截断防露出第 3 行半截) */
-      .sentence-preview-wrap {
-        background: rgba(255, 255, 255, 0.04);
-        padding: 6px 10px;
-        border-radius: 6px;
-        margin-bottom: 12px;
-      }
-      .sentence-preview {
-        padding: 0;
-        margin: 0;
-        font-size: 13px;
-        line-height: 1.5;
-        min-height: 39px;
-        max-height: 39px;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        display: -webkit-box;
-        -webkit-line-clamp: 2;
-        -webkit-box-orient: vertical;
       }
 
       /* 控制按钮主行 */
@@ -514,6 +543,12 @@ export class FloatingBar {
           </div>
           <div class="actions-box">
             <span class="progress-badge" id="tts-progress">0 / 0</span>
+            <button class="reader-pill" id="tts-reader-open" title="开启阅读模式">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M21 5c-1.11-.35-2.33-.5-3.5-.5-1.95 0-4.05.4-5.5 1.5-1.45-1.1-3.55-1.5-5.5-1.5S2.45 4.9 1 6v14.65c0 .25.25.5.5.5.1 0 .15-.05.25-.05C3.1 20.45 5.05 20 6.5 20c1.95 0 4.05.4 5.5 1.5 1.35-.85 3.8-1.5 5.5-1.5 1.65 0 3.35.3 4.75 1.05.1.05.15.05.25.05.25 0 .5-.25.5-.5V6c-.6-.45-1.25-.75-2-1zm0 13.5c-1.1-.35-2.3-.5-3.5-.5-1.7 0-4.15.65-5.5 1.5V8c1.35-.85 3.8-1.5 5.5-1.5 1.2 0 2.4.15 3.5.5v11.5z"/>
+              </svg>
+              <span>阅读</span>
+            </button>
             <button class="icon-btn" id="tts-gear" title="配置 Worker">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>
@@ -525,10 +560,6 @@ export class FloatingBar {
               </svg>
             </button>
           </div>
-        </div>
-
-        <div class="sentence-preview-wrap">
-          <div class="sentence-preview" id="tts-sentence">点击播放开始听书…</div>
         </div>
 
         <!-- 主控区 -->
@@ -553,10 +584,7 @@ export class FloatingBar {
         <div class="settings-row">
           <button class="rate-pill" id="tts-rate">${config.rate.toFixed(1)}x</button>
           <select class="voice-select" id="tts-voice">
-            <option value="zh-CN-XiaoxiaoNeural">晓晓 (女声·标准)</option>
-            <option value="zh-CN-YunxiNeural">云希 (男声·生动)</option>
-            <option value="zh-CN-YunjianNeural">云健 (男声·沉稳)</option>
-            <option value="zh-CN-XiaoyiNeural">晓伊 (女声·灵动)</option>
+            ${buildVoiceOptionsHtml()}
           </select>
         </div>
 
@@ -591,7 +619,6 @@ export class FloatingBar {
     this.playBtn = this.shadow.querySelector('#tts-play')!;
     this.titleEl = this.shadow.querySelector('#tts-title')!;
     this.progressEl = this.shadow.querySelector('#tts-progress')!;
-    this.textEl = this.shadow.querySelector('#tts-sentence')!;
     this.rateBtn = this.shadow.querySelector('#tts-rate')!;
     this.voiceSelect = this.shadow.querySelector('#tts-voice')! as HTMLSelectElement;
     this.toastEl = this.shadow.querySelector('#tts-toast')!;
@@ -775,6 +802,12 @@ export class FloatingBar {
       this.collapsePanel();
     });
 
+    // 开启阅读模式
+    this.shadow.querySelector('#tts-reader-open')!.addEventListener('click', () => {
+      this.collapsePanel();
+      this.events.onOpenReader();
+    });
+
     // 播放/暂停
     this.playBtn.addEventListener('click', () => {
       this.events.onPlayToggle();
@@ -792,11 +825,8 @@ export class FloatingBar {
     });
 
     // 循环切换语速：1.0x -> 1.2x -> 1.5x -> 2.0x -> 1.0x
-    const rates = [1.0, 1.2, 1.5, 2.0];
     this.rateBtn.addEventListener('click', () => {
-      const idx = rates.findIndex((r) => Math.abs(r - this.currentRate) < 0.05);
-      const nextIdx = (idx + 1) % rates.length;
-      this.currentRate = rates[nextIdx];
+      this.currentRate = getNextRate(this.currentRate);
       this.rateBtn.textContent = `${this.currentRate.toFixed(1)}x`;
       this.events.onRateChange(this.currentRate);
       this.showToast(`语速已切换为 ${this.currentRate.toFixed(1)}x`);
@@ -824,37 +854,15 @@ export class FloatingBar {
     });
 
     // 测试 Worker 连接
-    this.testBtn.addEventListener('click', async () => {
-      const url = this.workerInput.value.trim();
-      const token = this.tokenInput.value.trim();
-
-      if (!url) {
-        this.showToast('请先输入 Worker 地址');
-        return;
-      }
-
-      this.testBtn.disabled = true;
-      this.testBtn.textContent = '测试中…';
-      this.testResultEl.className = 'test-result';
-      this.testResultEl.style.display = 'none';
-
-      try {
-        const res = await this.events.onTestConfig(url, token);
-        if (res.success) {
-          this.testResultEl.className = 'test-result success';
-          this.testResultEl.textContent = `✅ 连接成功 (${res.source === 'fetch' ? '原生 fetch' : 'GM_xhr'}, 耗时 ${res.duration}ms, 大小 ${res.bytes}B)`;
-        } else {
-          this.testResultEl.className = 'test-result error';
-          this.testResultEl.textContent = `❌ 连接失败: ${res.error || '未知错误'}`;
-        }
-      } catch (err: any) {
-        this.testResultEl.className = 'test-result error';
-        this.testResultEl.textContent = `❌ 测试异常: ${err?.message || err}`;
-      } finally {
-        this.testResultEl.style.display = 'block';
-        this.testBtn.disabled = false;
-        this.testBtn.textContent = '测试连接';
-      }
+    this.testBtn.addEventListener('click', () => {
+      void executeConnectionTest({
+        urlInput: this.workerInput,
+        tokenInput: this.tokenInput,
+        testBtn: this.testBtn,
+        resultEl: this.testResultEl,
+        onTest: (url, token) => this.events.onTestConfig(url, token),
+        onEmptyUrl: () => this.showToast('请先输入 Worker 地址'),
+      });
     });
 
     // 跳转当前章节
@@ -870,25 +878,26 @@ export class FloatingBar {
   }
 
   private expandPanel(): void {
+    if (this.isSuppressed) return;
     this.panelEl.classList.add('open');
     this.ballEl.style.display = 'none';
   }
 
   private collapsePanel(): void {
     this.panelEl.classList.remove('open');
-    this.ballEl.style.display = 'flex';
+    this.ballEl.style.display = this.isSuppressed ? 'none' : 'flex';
   }
 
   private updatePlayButton(): void {
     const icon = this.shadow.querySelector('#tts-play-icon')!;
     if (this.playerState === 'playing') {
-      icon.innerHTML = '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>';
+      icon.innerHTML = SVG_PAUSE_PATH;
       this.playBtn.title = '暂停';
     } else if (this.playerState === 'loading') {
-      icon.innerHTML = '<path d="M8 5v14l11-7z"/>';
+      icon.innerHTML = SVG_PLAY_PATH;
       this.playBtn.title = '加载中…';
     } else {
-      icon.innerHTML = '<path d="M8 5v14l11-7z"/>';
+      icon.innerHTML = SVG_PLAY_PATH;
       this.playBtn.title = '播放';
     }
   }

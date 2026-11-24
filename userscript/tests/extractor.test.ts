@@ -1,6 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import { JSDOM } from 'jsdom';
-import { extractChapterContent, extractNextChapterUrl, cleanLine } from '../src/core/extractor';
+import {
+  extractChapterContent,
+  extractNextChapterUrl,
+  extractPrevChapterUrl,
+  findContentElement,
+  cleanLine,
+} from '../src/core/extractor';
 
 describe('extractor.ts - 正文与下一章链接提取引擎', () => {
   it('应当清洗字符串中的不可见字符与冗余空白', () => {
@@ -183,5 +189,46 @@ describe('extractor.ts - 正文与下一章链接提取引擎', () => {
     const nextUrl = extractNextChapterUrl(dom.window.document, 'https://example.com/chapter_1.html');
 
     expect(nextUrl).toBe('https://example.com/chapter_2.html');
+  });
+
+  it('extractPrevChapterUrl：准确提取上一章链接，不被下一章/目录干扰，并写入 ChapterContent', () => {
+    const html = `
+      <!DOCTYPE html>
+      <html>
+        <body>
+          <h1>第三章 风起云涌</h1>
+          <div id="chaptercontent">
+            夜幕降临，苍穹之上繁星点点，微凉的山风悄然拂过静谧的石阶与古老的松柏。
+          </div>
+          <div class="nav">
+            <a href="/book/2.html">上一章</a>
+            <a href="/book/index.html">目录</a>
+            <a href="/book/4.html">下一章</a>
+          </div>
+        </body>
+      </html>
+    `;
+    const url = 'https://example.com/book/3.html';
+    const dom = new JSDOM(html, { url });
+    expect(extractPrevChapterUrl(dom.window.document, url)).toBe('https://example.com/book/2.html');
+
+    const content = extractChapterContent(dom.window.document, url);
+    expect(content.prevChapterUrl).toBe('https://example.com/book/2.html');
+    expect(content.nextChapterUrl).toBe('https://example.com/book/4.html');
+  });
+
+  it('findContentElement：准确识别小说正文容器供原网页高亮使用', () => {
+    const html = `
+      <!DOCTYPE html>
+      <html>
+        <body>
+          <nav><a href="/1">首页</a><a href="/2">分类</a></nav>
+          <div id="chaptercontent">这是小说正文容器，包含超过三十个有效文字以确保能够准确命中最优正文节点。</div>
+        </body>
+      </html>
+    `;
+    const dom = new JSDOM(html, { url: 'https://example.com/1.html' });
+    const el = findContentElement(dom.window.document);
+    expect(el?.id).toBe('chaptercontent');
   });
 });

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelTTS-Userscript
 // @namespace    https://github.com/John-S-hall/ForIris
-// @version      0.2.1
+// @version      0.3.0
 // @author       John-S-hall
 // @description  移动端网页小说听书油猴脚本
 // @match        *://*/*
@@ -1853,10 +1853,30 @@
     "#chapter-content",
     ".chapter-content"
   ];
-  const NEXT_CHAPTER_EXCLUDE_REGEX = /(?:上一|目录|书架|书签|推荐|预告|催更|评论|投票)/;
+  const NEXT_CHAPTER_EXCLUDE_REGEX = /(?:上一|上章|上页|目录|书架|书签|推荐|预告|催更|评论|投票)/;
   const NEXT_CHAPTER_TIER1_REGEX = /^(?:下一[章节回话]|下章|后一章|nextchapter)[→>»›]*$/i;
   const NEXT_CHAPTER_TIER2_REGEX = /^(?:下一页|下页|nextpage|next)[→>»›]*$/i;
   const NEXT_CHAPTER_TIER3_REGEX = /(?:下一章|下一页|下页|下一节|下章)/;
+  const PREV_CHAPTER_EXCLUDE_REGEX = /(?:下一|下章|下页|目录|书架|书签|推荐|预告|催更|评论|投票)/;
+  const PREV_CHAPTER_TIER1_REGEX = /^(?:上一[章节回话]|上章|前一章|prevchapter|previouschapter)[←<«‹]*$/i;
+  const PREV_CHAPTER_TIER2_REGEX = /^(?:上一页|上页|prevpage|prev|previous)[←<«‹]*$/i;
+  const PREV_CHAPTER_TIER3_REGEX = /(?:上一章|上一页|上页|上一节|上章)/;
+  const NEXT_CHAPTER_RULE = {
+    rel: "next",
+    knownSelector: "#pb_next, #next_url, #pt_next, #nextchapter, #linkNext, a.next-chapter",
+    excludeRegex: NEXT_CHAPTER_EXCLUDE_REGEX,
+    tier1Regex: NEXT_CHAPTER_TIER1_REGEX,
+    tier2Regex: NEXT_CHAPTER_TIER2_REGEX,
+    tier3Regex: NEXT_CHAPTER_TIER3_REGEX
+  };
+  const PREV_CHAPTER_RULE = {
+    rel: "prev",
+    knownSelector: "#pb_prev, #prev_url, #pt_prev, #prevchapter, #linkPrev, a.prev-chapter",
+    excludeRegex: PREV_CHAPTER_EXCLUDE_REGEX,
+    tier1Regex: PREV_CHAPTER_TIER1_REGEX,
+    tier2Regex: PREV_CHAPTER_TIER2_REGEX,
+    tier3Regex: PREV_CHAPTER_TIER3_REGEX
+  };
   const INVALID_HREF_PROTOCOL_REGEX = /^(?:javascript|mailto|tel):/i;
   const NOISE_TAGS = /* @__PURE__ */ new Set([
     "SCRIPT",
@@ -1881,7 +1901,7 @@
   function cleanParagraphs(rawText) {
     return rawText.split(/\r?\n+/).map(cleanLine).filter((line) => line.length > 0);
   }
-  function countEffectiveChars(paragraphs) {
+  function countEffectiveChars$1(paragraphs) {
     return paragraphs.reduce((sum, p) => sum + p.replace(/\s+/g, "").length, 0);
   }
   function extractParagraphsFromElement(element) {
@@ -1971,6 +1991,18 @@
     }
     return maxNonLinkLength >= MIN_CONTENT_CHAR_THRESHOLD ? bestElement : null;
   }
+  function findContentElement(doc) {
+    const matched = findFallbackContentElement(doc);
+    if (matched) return matched;
+    const semantic = doc.querySelector("article, main");
+    if (semantic) {
+      const stats = measureTextStats(semantic);
+      if (stats.nonLinkChars >= MIN_CONTENT_CHAR_THRESHOLD) {
+        return semantic;
+      }
+    }
+    return null;
+  }
   function extractFallbackTitle(doc) {
     var _a, _b;
     const h1 = doc.querySelector("h1");
@@ -2004,7 +2036,7 @@
       return null;
     }
   }
-  function extractNextChapterUrl(doc, currentUrl) {
+  function extractChapterNavUrl(doc, currentUrl, rule) {
     var _a, _b, _c, _d;
     const pageUrl = currentUrl || doc.baseURI || "http://localhost";
     let currentParsed = null;
@@ -2033,16 +2065,16 @@
       }
       const compactText = cleanLine(link.textContent || "").replace(/\s+/g, "");
       const compactTitle = cleanLine(link.getAttribute("title") || "").replace(/\s+/g, "");
-      if (NEXT_CHAPTER_EXCLUDE_REGEX.test(compactText) || NEXT_CHAPTER_EXCLUDE_REGEX.test(compactTitle)) {
+      if (rule.excludeRegex.test(compactText) || rule.excludeRegex.test(compactTitle)) {
         continue;
       }
-      const isKnownNextSelector = ((_d = link.getAttribute("rel")) == null ? void 0 : _d.toLowerCase()) === "next" || link.matches("#pb_next, #next_url, #pt_next, #nextchapter, #linkNext, a.next-chapter");
+      const isKnownSelector = ((_d = link.getAttribute("rel")) == null ? void 0 : _d.toLowerCase()) === rule.rel || link.matches(rule.knownSelector);
       let score = 0;
-      if (NEXT_CHAPTER_TIER1_REGEX.test(compactText) || isKnownNextSelector) {
+      if (rule.tier1Regex.test(compactText) || isKnownSelector) {
         score = 100;
-      } else if (NEXT_CHAPTER_TIER2_REGEX.test(compactText)) {
+      } else if (rule.tier2Regex.test(compactText)) {
         score = 70;
-      } else if (NEXT_CHAPTER_TIER3_REGEX.test(compactText) && compactText.length <= 16 || NEXT_CHAPTER_TIER3_REGEX.test(compactTitle) && compactTitle.length <= 16) {
+      } else if (rule.tier3Regex.test(compactText) && compactText.length <= 16 || rule.tier3Regex.test(compactTitle) && compactTitle.length <= 16) {
         score = 40;
       }
       if (score === 0) continue;
@@ -2055,8 +2087,15 @@
     }
     return bestUrl;
   }
+  function extractNextChapterUrl(doc, currentUrl) {
+    return extractChapterNavUrl(doc, currentUrl, NEXT_CHAPTER_RULE);
+  }
+  function extractPrevChapterUrl(doc, currentUrl) {
+    return extractChapterNavUrl(doc, currentUrl, PREV_CHAPTER_RULE);
+  }
   function extractChapterContent(doc, currentUrl) {
     const nextChapterUrl = extractNextChapterUrl(doc, currentUrl);
+    const prevChapterUrl = extractPrevChapterUrl(doc, currentUrl);
     let title = "";
     let paragraphs = [];
     try {
@@ -2072,7 +2111,7 @@
     } catch {
       paragraphs = [];
     }
-    const effectiveChars = countEffectiveChars(paragraphs);
+    const effectiveChars = countEffectiveChars$1(paragraphs);
     if (paragraphs.length === 0 || effectiveChars < 100) {
       const fallbackEl = findFallbackContentElement(doc);
       if (fallbackEl) {
@@ -2092,14 +2131,157 @@
     if (paragraphs.length > 0 && title && paragraphs[0] === title) {
       paragraphs.shift();
     }
-    if (countEffectiveChars(paragraphs) < MIN_CONTENT_CHAR_THRESHOLD) {
+    if (countEffectiveChars$1(paragraphs) < MIN_CONTENT_CHAR_THRESHOLD) {
       paragraphs = [];
     }
     return {
       title,
       paragraphs,
-      nextChapterUrl
+      nextChapterUrl,
+      prevChapterUrl
     };
+  }
+  const DEFAULT_MIN_CHARS = 30;
+  const DEFAULT_MAX_CHARS = 120;
+  const PRIMARY_DELIMITER_REGEX = /([^\r\n。！？；!?]+(?:[。！？；!?]+[”’"'\)）》]*|$))/g;
+  const SECONDARY_DELIMITER_REGEX = /([^\r\n，,、：:——……]+(?:[，,、：:——……]+[”’"'\)）》]*|$))/g;
+  function isPunctuationOrWhitespaceOnly(str) {
+    return !/[\p{L}\p{N}]/u.test(str);
+  }
+  function hardSlice(text, chunkSize) {
+    const slices = [];
+    let index = 0;
+    while (index < text.length) {
+      slices.push(text.slice(index, index + chunkSize));
+      index += chunkSize;
+    }
+    return slices;
+  }
+  function splitOverlongSentence(sentence, maxChars) {
+    if (sentence.length <= maxChars) {
+      return [sentence];
+    }
+    const matches = sentence.match(SECONDARY_DELIMITER_REGEX);
+    if (!matches || matches.length <= 1) {
+      return hardSlice(sentence, maxChars);
+    }
+    const results = [];
+    let current = "";
+    for (const part of matches) {
+      if (!part) continue;
+      if (part.length > maxChars) {
+        if (current) {
+          results.push(current);
+          current = "";
+        }
+        results.push(...hardSlice(part, maxChars));
+      } else if (current.length + part.length <= maxChars) {
+        current += part;
+      } else {
+        if (current) results.push(current);
+        current = part;
+      }
+    }
+    if (current) {
+      results.push(current);
+    }
+    return results;
+  }
+  function splitTextToAtomicSentences(rawText, maxChars) {
+    if (!rawText || !rawText.trim()) {
+      return [];
+    }
+    const rawSegments = rawText.match(PRIMARY_DELIMITER_REGEX) || [rawText];
+    const atomicSentences = [];
+    for (const seg of rawSegments) {
+      const trimmed = seg.trim();
+      if (!trimmed || isPunctuationOrWhitespaceOnly(trimmed)) {
+        continue;
+      }
+      if (trimmed.length > maxChars) {
+        const pieces = splitOverlongSentence(trimmed, maxChars);
+        for (const piece of pieces) {
+          const pTrimmed = piece.trim();
+          if (pTrimmed && !isPunctuationOrWhitespaceOnly(pTrimmed)) {
+            atomicSentences.push(pTrimmed);
+          }
+        }
+      } else {
+        atomicSentences.push(trimmed);
+      }
+    }
+    return atomicSentences;
+  }
+  function appendSegment(target, seg) {
+    const last = target[target.length - 1];
+    if (last && last.paragraphIndex === seg.paragraphIndex) {
+      last.text += seg.text;
+    } else {
+      target.push({ paragraphIndex: seg.paragraphIndex, text: seg.text });
+    }
+  }
+  function chunkParagraphs(paragraphs, options) {
+    const minChars = DEFAULT_MIN_CHARS;
+    const maxChars = DEFAULT_MAX_CHARS;
+    if (!Array.isArray(paragraphs) || paragraphs.length === 0) {
+      return [];
+    }
+    const atomicSegments = [];
+    for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex++) {
+      const pieces = splitTextToAtomicSentences(paragraphs[paragraphIndex], maxChars);
+      for (const piece of pieces) {
+        atomicSegments.push({ paragraphIndex, text: piece });
+      }
+    }
+    if (atomicSegments.length === 0) {
+      return [];
+    }
+    const merged = [];
+    let bufferText = "";
+    let bufferSegments = [];
+    for (const seg of atomicSegments) {
+      if (!bufferText) {
+        bufferText = seg.text;
+        bufferSegments = [{ paragraphIndex: seg.paragraphIndex, text: seg.text }];
+        continue;
+      }
+      if (bufferText.length < minChars && bufferText.length + seg.text.length <= maxChars) {
+        bufferText += seg.text;
+        appendSegment(bufferSegments, seg);
+      } else {
+        merged.push({
+          index: merged.length,
+          text: bufferText,
+          segments: bufferSegments
+        });
+        bufferText = seg.text;
+        bufferSegments = [{ paragraphIndex: seg.paragraphIndex, text: seg.text }];
+      }
+    }
+    if (bufferText) {
+      if (bufferText.length < minChars && merged.length > 0 && merged[merged.length - 1].text.length + bufferText.length <= maxChars) {
+        const prev = merged[merged.length - 1];
+        prev.text += bufferText;
+        for (const seg of bufferSegments) {
+          appendSegment(prev.segments, seg);
+        }
+      } else {
+        merged.push({
+          index: merged.length,
+          text: bufferText,
+          segments: bufferSegments
+        });
+      }
+    }
+    const filtered = merged.filter((chunk) => !isPunctuationOrWhitespaceOnly(chunk.text));
+    filtered.forEach((chunk, idx) => {
+      chunk.index = idx;
+    });
+    return filtered;
+  }
+  function chunkText(input, options) {
+    const paragraphs = Array.isArray(input) ? input : [input];
+    return chunkParagraphs(paragraphs).map((chunk) => chunk.text);
   }
   class WebSpeechEngine {
     constructor() {
@@ -2166,104 +2348,6 @@
         this.currentUtterance = null;
       }
     }
-  }
-  const DEFAULT_MIN_CHARS = 30;
-  const DEFAULT_MAX_CHARS = 120;
-  const PRIMARY_DELIMITER_REGEX = /([^\r\n。！？；!?]+(?:[。！？；!?]+[”’"'\)）》]*|$))/g;
-  const SECONDARY_DELIMITER_REGEX = /([^\r\n，,、：:——……]+(?:[，,、：:——……]+[”’"'\)）》]*|$))/g;
-  function isPunctuationOrWhitespaceOnly(str) {
-    return !/[\p{L}\p{N}]/u.test(str);
-  }
-  function hardSlice(text, chunkSize) {
-    const slices = [];
-    let index = 0;
-    while (index < text.length) {
-      slices.push(text.slice(index, index + chunkSize));
-      index += chunkSize;
-    }
-    return slices;
-  }
-  function splitOverlongSentence(sentence, maxChars) {
-    if (sentence.length <= maxChars) {
-      return [sentence];
-    }
-    const matches = sentence.match(SECONDARY_DELIMITER_REGEX);
-    if (!matches || matches.length <= 1) {
-      return hardSlice(sentence, maxChars);
-    }
-    const results = [];
-    let current = "";
-    for (const part of matches) {
-      if (!part) continue;
-      if (part.length > maxChars) {
-        if (current) {
-          results.push(current);
-          current = "";
-        }
-        results.push(...hardSlice(part, maxChars));
-      } else if (current.length + part.length <= maxChars) {
-        current += part;
-      } else {
-        if (current) results.push(current);
-        current = part;
-      }
-    }
-    if (current) {
-      results.push(current);
-    }
-    return results;
-  }
-  function chunkText(input, options) {
-    const minChars = DEFAULT_MIN_CHARS;
-    const maxChars = DEFAULT_MAX_CHARS;
-    const rawText = Array.isArray(input) ? input.join("\n") : input;
-    if (!rawText || !rawText.trim()) {
-      return [];
-    }
-    const rawSegments = rawText.match(PRIMARY_DELIMITER_REGEX) || [rawText];
-    const atomicSentences = [];
-    for (const seg of rawSegments) {
-      const trimmed = seg.trim();
-      if (!trimmed || isPunctuationOrWhitespaceOnly(trimmed)) {
-        continue;
-      }
-      if (trimmed.length > maxChars) {
-        const pieces = splitOverlongSentence(trimmed, maxChars);
-        for (const piece of pieces) {
-          const pTrimmed = piece.trim();
-          if (pTrimmed && !isPunctuationOrWhitespaceOnly(pTrimmed)) {
-            atomicSentences.push(pTrimmed);
-          }
-        }
-      } else {
-        atomicSentences.push(trimmed);
-      }
-    }
-    if (atomicSentences.length === 0) {
-      return [];
-    }
-    const mergedChunks = [];
-    let buffer = "";
-    for (const sentence of atomicSentences) {
-      if (!buffer) {
-        buffer = sentence;
-        continue;
-      }
-      if (buffer.length < minChars && buffer.length + sentence.length <= maxChars) {
-        buffer += sentence;
-      } else {
-        mergedChunks.push(buffer);
-        buffer = sentence;
-      }
-    }
-    if (buffer) {
-      if (buffer.length < minChars && mergedChunks.length > 0 && mergedChunks[mergedChunks.length - 1].length + buffer.length <= maxChars) {
-        mergedChunks[mergedChunks.length - 1] += buffer;
-      } else {
-        mergedChunks.push(buffer);
-      }
-    }
-    return mergedChunks.filter((chunk) => !isPunctuationOrWhitespaceOnly(chunk));
   }
   const MAX_CACHE_SIZE = 3;
   const SILENT_AUDIO_WAV = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
@@ -2897,19 +2981,39 @@
       }
     }
   }
+  const DEFAULT_READER_SETTINGS = {
+    theme: "sepia",
+    fontSize: 18,
+    lineHeight: 1.85,
+    autoEnter: false
+  };
+  const VALID_THEMES = /* @__PURE__ */ new Set(["light", "sepia", "green", "dark"]);
   const DEFAULT_CONFIG = {
     workerUrl: "",
     token: "dev-secret",
     voice: "zh-CN-XiaoxiaoNeural",
-    rate: 1
+    rate: 1,
+    reader: { ...DEFAULT_READER_SETTINGS }
   };
   const STORAGE_KEY = "novel_tts_config";
+  function normalizeReaderSettings(raw) {
+    const src = raw && typeof raw === "object" ? raw : {};
+    const theme = src.theme && VALID_THEMES.has(src.theme) ? src.theme : DEFAULT_READER_SETTINGS.theme;
+    const fontSize = typeof src.fontSize === "number" && Number.isFinite(src.fontSize) ? Math.max(14, Math.min(28, Math.round(src.fontSize))) : DEFAULT_READER_SETTINGS.fontSize;
+    const lineHeight = typeof src.lineHeight === "number" && Number.isFinite(src.lineHeight) ? Math.max(1.4, Math.min(2.4, Number(src.lineHeight.toFixed(2)))) : DEFAULT_READER_SETTINGS.lineHeight;
+    const autoEnter = typeof src.autoEnter === "boolean" ? src.autoEnter : DEFAULT_READER_SETTINGS.autoEnter;
+    return { theme, fontSize, lineHeight, autoEnter };
+  }
   class ConfigStorage {
     static isGMSupported() {
       return typeof GM_getValue === "function" && typeof GM_setValue === "function";
     }
     static normalizeConfig(parsed) {
-      const merged = { ...DEFAULT_CONFIG, ...parsed };
+      const merged = {
+        ...DEFAULT_CONFIG,
+        ...parsed,
+        reader: normalizeReaderSettings(parsed.reader)
+      };
       if (typeof merged.token !== "string" || merged.token.trim().length === 0) {
         merged.token = DEFAULT_CONFIG.token;
       }
@@ -2941,11 +3045,18 @@
         }
       } catch {
       }
-      return { ...DEFAULT_CONFIG };
+      return {
+        ...DEFAULT_CONFIG,
+        reader: { ...DEFAULT_READER_SETTINGS }
+      };
     }
     static save(patch) {
       const current = this.load();
-      const updated = this.normalizeConfig({ ...current, ...patch });
+      const updated = this.normalizeConfig({
+        ...current,
+        ...patch,
+        reader: patch.reader ? { ...current.reader, ...patch.reader } : current.reader
+      });
       try {
         const serialized = JSON.stringify(updated);
         if (this.isGMSupported()) {
@@ -2957,6 +3068,15 @@
         console.warn("[NovelTTS] Failed to persist config:", err);
       }
       return updated;
+    }
+    static saveReaderSettings(patch) {
+      const current = this.load();
+      return this.save({
+        reader: {
+          ...current.reader,
+          ...patch
+        }
+      });
     }
   }
   function detectCharset(headers, buffer) {
@@ -3207,14 +3327,15 @@
     /**
      * 静默拉取指定章节的 HTML 并解析正文
      * @param targetUrl 下一章完整 URL
+     * @param options 加载选项（allowVisited 为 true 时允许重读已访问章节，如手动上一章）
      */
-    async loadChapter(targetUrl) {
+    async loadChapter(targetUrl, options) {
       const normalized = this.normalizeUrl(targetUrl);
       if (!normalized) {
         console.warn("[NovelTTS] Invalid chapter URL:", targetUrl);
         return null;
       }
-      if (this.visitedUrls.has(normalized)) {
+      if (!(options == null ? void 0 : options.allowVisited) && this.visitedUrls.has(normalized)) {
         console.warn("[NovelTTS] Prevented loop: already visited URL:", normalized);
         return null;
       }
@@ -3545,6 +3666,51 @@
       }
     }
   }
+  const VOICE_OPTIONS = [
+    { value: "zh-CN-XiaoxiaoNeural", label: "晓晓 (女声·标准)" },
+    { value: "zh-CN-YunxiNeural", label: "云希 (男声·生动)" },
+    { value: "zh-CN-YunjianNeural", label: "云健 (男声·沉稳)" },
+    { value: "zh-CN-XiaoyiNeural", label: "晓伊 (女声·灵动)" }
+  ];
+  const RATE_OPTIONS = [1, 1.2, 1.5, 2];
+  const SVG_PLAY_PATH = '<path d="M8 5v14l11-7z"/>';
+  const SVG_PAUSE_PATH = '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>';
+  function buildVoiceOptionsHtml() {
+    return VOICE_OPTIONS.map((v) => `<option value="${v.value}">${v.label}</option>`).join("");
+  }
+  function getNextRate(currentRate) {
+    const idx = RATE_OPTIONS.findIndex((r) => Math.abs(r - currentRate) < 0.05);
+    return RATE_OPTIONS[(idx + 1) % RATE_OPTIONS.length];
+  }
+  async function executeConnectionTest(opts) {
+    const url = opts.urlInput.value.trim();
+    const token = opts.tokenInput.value.trim();
+    if (!url) {
+      opts.onEmptyUrl();
+      return;
+    }
+    opts.testBtn.disabled = true;
+    opts.testBtn.textContent = "测试中…";
+    opts.resultEl.className = "test-result";
+    opts.resultEl.style.display = "none";
+    try {
+      const res = await opts.onTest(url, token);
+      if (res.success) {
+        opts.resultEl.className = "test-result success";
+        opts.resultEl.textContent = `✅ 连接成功 (${res.source === "fetch" ? "原生 fetch" : "GM_xhr"}, 耗时 ${res.duration}ms, 大小 ${res.bytes}B)`;
+      } else {
+        opts.resultEl.className = "test-result error";
+        opts.resultEl.textContent = `❌ 连接失败: ${res.error || "未知错误"}`;
+      }
+    } catch (err) {
+      opts.resultEl.className = "test-result error";
+      opts.resultEl.textContent = `❌ 测试异常: ${(err == null ? void 0 : err.message) || err}`;
+    } finally {
+      opts.resultEl.style.display = "block";
+      opts.testBtn.disabled = false;
+      opts.testBtn.textContent = "测试连接";
+    }
+  }
   class FloatingBar {
     constructor(config, events) {
       __publicField(this, "host");
@@ -3552,6 +3718,7 @@
       __publicField(this, "events");
       // 状态引用
       __publicField(this, "isSettingsOpen", false);
+      __publicField(this, "isSuppressed", false);
       __publicField(this, "playerState", "idle");
       __publicField(this, "currentChapterUrl", null);
       __publicField(this, "currentRate", 1);
@@ -3562,7 +3729,6 @@
       __publicField(this, "playBtn");
       __publicField(this, "titleEl");
       __publicField(this, "progressEl");
-      __publicField(this, "textEl");
       __publicField(this, "rateBtn");
       __publicField(this, "voiceSelect");
       __publicField(this, "toastEl");
@@ -3644,15 +3810,33 @@
         this.host.style.setProperty("display", "none", "important");
       }
     }
+    /** 阅读模式开启时抑制悬浮球与底栏面板，仅保留 Toast 提示 */
+    setSuppressed(suppressed) {
+      this.isSuppressed = suppressed;
+      if (suppressed) {
+        this.panelEl.classList.remove("open");
+        this.ballEl.style.display = "none";
+        this.panelEl.style.display = "none";
+      } else {
+        this.panelEl.style.display = "";
+        this.ballEl.style.display = "flex";
+      }
+    }
     // ─── 状态更新接口 ──────────────────────────────────────────────────────
     updatePlayerState(state) {
       this.playerState = state;
       this.updatePlayButton();
       this.updateBallAnimation();
     }
-    updateProgress(index, total, sentence) {
+    updateProgress(index, total, _sentence) {
       this.progressEl.textContent = `${index + 1} / ${total}`;
-      this.textEl.textContent = sentence || "正在准备朗读…";
+    }
+    syncRate(rate) {
+      this.currentRate = rate;
+      this.rateBtn.textContent = `${rate.toFixed(1)}x`;
+    }
+    syncVoice(voice) {
+      this.voiceSelect.value = voice;
     }
     updateChapter(title, currentUrl) {
       this.titleEl.textContent = title;
@@ -3759,12 +3943,15 @@
         display: flex;
         justify-content: space-between;
         align-items: center;
-        margin-bottom: 6px;
+        gap: 8px;
+        margin-bottom: 12px;
       }
       .title-box {
         display: flex;
         align-items: center;
         gap: 8px;
+        min-width: 0;
+        flex: 1;
         overflow: hidden;
       }
       .title {
@@ -3774,10 +3961,10 @@
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-        max-width: 220px;
       }
       .jump-btn {
         display: none;
+        flex-shrink: 0;
         font-size: 11px;
         padding: 2px 6px;
         background: rgba(56, 189, 248, 0.2);
@@ -3789,7 +3976,25 @@
       .actions-box {
         display: flex;
         align-items: center;
-        gap: 10px;
+        flex-shrink: 0;
+        gap: 8px;
+      }
+      .reader-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        background: rgba(56, 189, 248, 0.16);
+        border: 1px solid rgba(56, 189, 248, 0.35);
+        color: #38bdf8;
+        font-size: 11px;
+        font-weight: 500;
+        padding: 3px 8px;
+        border-radius: 10px;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      .reader-pill:active {
+        background: rgba(56, 189, 248, 0.28);
       }
       .icon-btn {
         background: none;
@@ -3810,27 +4015,6 @@
         padding: 2px 7px;
         border-radius: 10px;
         color: #94a3b8;
-      }
-
-      /* 当前朗读句预览 (外层负责 padding，内层精准 2 行截断防露出第 3 行半截) */
-      .sentence-preview-wrap {
-        background: rgba(255, 255, 255, 0.04);
-        padding: 6px 10px;
-        border-radius: 6px;
-        margin-bottom: 12px;
-      }
-      .sentence-preview {
-        padding: 0;
-        margin: 0;
-        font-size: 13px;
-        line-height: 1.5;
-        min-height: 39px;
-        max-height: 39px;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        display: -webkit-box;
-        -webkit-line-clamp: 2;
-        -webkit-box-orient: vertical;
       }
 
       /* 控制按钮主行 */
@@ -4024,6 +4208,12 @@
           </div>
           <div class="actions-box">
             <span class="progress-badge" id="tts-progress">0 / 0</span>
+            <button class="reader-pill" id="tts-reader-open" title="开启阅读模式">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M21 5c-1.11-.35-2.33-.5-3.5-.5-1.95 0-4.05.4-5.5 1.5-1.45-1.1-3.55-1.5-5.5-1.5S2.45 4.9 1 6v14.65c0 .25.25.5.5.5.1 0 .15-.05.25-.05C3.1 20.45 5.05 20 6.5 20c1.95 0 4.05.4 5.5 1.5 1.35-.85 3.8-1.5 5.5-1.5 1.65 0 3.35.3 4.75 1.05.1.05.15.05.25.05.25 0 .5-.25.5-.5V6c-.6-.45-1.25-.75-2-1zm0 13.5c-1.1-.35-2.3-.5-3.5-.5-1.7 0-4.15.65-5.5 1.5V8c1.35-.85 3.8-1.5 5.5-1.5 1.2 0 2.4.15 3.5.5v11.5z"/>
+              </svg>
+              <span>阅读</span>
+            </button>
             <button class="icon-btn" id="tts-gear" title="配置 Worker">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>
@@ -4035,10 +4225,6 @@
               </svg>
             </button>
           </div>
-        </div>
-
-        <div class="sentence-preview-wrap">
-          <div class="sentence-preview" id="tts-sentence">点击播放开始听书…</div>
         </div>
 
         <!-- 主控区 -->
@@ -4063,10 +4249,7 @@
         <div class="settings-row">
           <button class="rate-pill" id="tts-rate">${config.rate.toFixed(1)}x</button>
           <select class="voice-select" id="tts-voice">
-            <option value="zh-CN-XiaoxiaoNeural">晓晓 (女声·标准)</option>
-            <option value="zh-CN-YunxiNeural">云希 (男声·生动)</option>
-            <option value="zh-CN-YunjianNeural">云健 (男声·沉稳)</option>
-            <option value="zh-CN-XiaoyiNeural">晓伊 (女声·灵动)</option>
+            ${buildVoiceOptionsHtml()}
           </select>
         </div>
 
@@ -4098,7 +4281,6 @@
       this.playBtn = this.shadow.querySelector("#tts-play");
       this.titleEl = this.shadow.querySelector("#tts-title");
       this.progressEl = this.shadow.querySelector("#tts-progress");
-      this.textEl = this.shadow.querySelector("#tts-sentence");
       this.rateBtn = this.shadow.querySelector("#tts-rate");
       this.voiceSelect = this.shadow.querySelector("#tts-voice");
       this.toastEl = this.shadow.querySelector("#tts-toast");
@@ -4248,6 +4430,10 @@
       this.shadow.querySelector("#tts-close").addEventListener("click", () => {
         this.collapsePanel();
       });
+      this.shadow.querySelector("#tts-reader-open").addEventListener("click", () => {
+        this.collapsePanel();
+        this.events.onOpenReader();
+      });
       this.playBtn.addEventListener("click", () => {
         this.events.onPlayToggle();
       });
@@ -4260,11 +4446,8 @@
       this.shadow.querySelector("#tts-next-chapter").addEventListener("click", () => {
         this.events.onNextChapter();
       });
-      const rates = [1, 1.2, 1.5, 2];
       this.rateBtn.addEventListener("click", () => {
-        const idx = rates.findIndex((r) => Math.abs(r - this.currentRate) < 0.05);
-        const nextIdx = (idx + 1) % rates.length;
-        this.currentRate = rates[nextIdx];
+        this.currentRate = getNextRate(this.currentRate);
         this.rateBtn.textContent = `${this.currentRate.toFixed(1)}x`;
         this.events.onRateChange(this.currentRate);
         this.showToast(`语速已切换为 ${this.currentRate.toFixed(1)}x`);
@@ -4284,34 +4467,15 @@
         this.isSettingsOpen = false;
         this.settingsDrawer.classList.remove("open");
       });
-      this.testBtn.addEventListener("click", async () => {
-        const url = this.workerInput.value.trim();
-        const token = this.tokenInput.value.trim();
-        if (!url) {
-          this.showToast("请先输入 Worker 地址");
-          return;
-        }
-        this.testBtn.disabled = true;
-        this.testBtn.textContent = "测试中…";
-        this.testResultEl.className = "test-result";
-        this.testResultEl.style.display = "none";
-        try {
-          const res = await this.events.onTestConfig(url, token);
-          if (res.success) {
-            this.testResultEl.className = "test-result success";
-            this.testResultEl.textContent = `✅ 连接成功 (${res.source === "fetch" ? "原生 fetch" : "GM_xhr"}, 耗时 ${res.duration}ms, 大小 ${res.bytes}B)`;
-          } else {
-            this.testResultEl.className = "test-result error";
-            this.testResultEl.textContent = `❌ 连接失败: ${res.error || "未知错误"}`;
-          }
-        } catch (err) {
-          this.testResultEl.className = "test-result error";
-          this.testResultEl.textContent = `❌ 测试异常: ${(err == null ? void 0 : err.message) || err}`;
-        } finally {
-          this.testResultEl.style.display = "block";
-          this.testBtn.disabled = false;
-          this.testBtn.textContent = "测试连接";
-        }
+      this.testBtn.addEventListener("click", () => {
+        void executeConnectionTest({
+          urlInput: this.workerInput,
+          tokenInput: this.tokenInput,
+          testBtn: this.testBtn,
+          resultEl: this.testResultEl,
+          onTest: (url, token) => this.events.onTestConfig(url, token),
+          onEmptyUrl: () => this.showToast("请先输入 Worker 地址")
+        });
       });
       this.jumpChapterBtn.addEventListener("click", () => {
         if (this.currentChapterUrl) {
@@ -4324,23 +4488,24 @@
       });
     }
     expandPanel() {
+      if (this.isSuppressed) return;
       this.panelEl.classList.add("open");
       this.ballEl.style.display = "none";
     }
     collapsePanel() {
       this.panelEl.classList.remove("open");
-      this.ballEl.style.display = "flex";
+      this.ballEl.style.display = this.isSuppressed ? "none" : "flex";
     }
     updatePlayButton() {
       const icon = this.shadow.querySelector("#tts-play-icon");
       if (this.playerState === "playing") {
-        icon.innerHTML = '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>';
+        icon.innerHTML = SVG_PAUSE_PATH;
         this.playBtn.title = "暂停";
       } else if (this.playerState === "loading") {
-        icon.innerHTML = '<path d="M8 5v14l11-7z"/>';
+        icon.innerHTML = SVG_PLAY_PATH;
         this.playBtn.title = "加载中…";
       } else {
-        icon.innerHTML = '<path d="M8 5v14l11-7z"/>';
+        icon.innerHTML = SVG_PLAY_PATH;
         this.playBtn.title = "播放";
       }
     }
@@ -4352,6 +4517,1509 @@
       }
     }
   }
+  const USER_SCROLL_PROTECT_MS$1 = 4e3;
+  const LINE_HEIGHT_PRESETS = [
+    { value: 1.6, label: "紧凑" },
+    { value: 1.85, label: "适中" },
+    { value: 2.1, label: "宽松" }
+  ];
+  const THEME_PRESETS = [
+    { value: "light", label: "日间", swatch: "#ffffff" },
+    { value: "sepia", label: "羊皮纸", swatch: "#f4ecd8" },
+    { value: "green", label: "护眼绿", swatch: "#cce8cf" },
+    { value: "dark", label: "夜间", swatch: "#141923" }
+  ];
+  class ReaderView {
+    constructor(config, events) {
+      __publicField(this, "host");
+      __publicField(this, "shadow");
+      __publicField(this, "events");
+      __publicField(this, "settings");
+      __publicField(this, "currentRate");
+      __publicField(this, "playerState", "idle");
+      __publicField(this, "activeChunkIndex", -1);
+      __publicField(this, "totalChunks", 0);
+      __publicField(this, "currentChapterUrl", null);
+      __publicField(this, "hasPrevChapter", false);
+      __publicField(this, "hasNextChapter", false);
+      __publicField(this, "isChapterLoading", false);
+      __publicField(this, "opened", false);
+      __publicField(this, "isMenuOpen", false);
+      __publicField(this, "activeSubpanel", "none");
+      // 原网页滚动锁定备份
+      __publicField(this, "savedHtmlOverflow", null);
+      __publicField(this, "savedBodyOverflow", null);
+      // 手动滑动保护与双击识别
+      __publicField(this, "lastUserScrollAt", 0);
+      __publicField(this, "programmaticScrollUntil", 0);
+      __publicField(this, "lastTapChunkIdx", -1);
+      __publicField(this, "lastTapAt", 0);
+      __publicField(this, "singleTapTimer", null);
+      // DOM 引用
+      __publicField(this, "rootEl");
+      __publicField(this, "scrollEl");
+      __publicField(this, "statusTitleEl");
+      __publicField(this, "statusProgressEl");
+      __publicField(this, "articleTitleEl");
+      __publicField(this, "articleBodyEl");
+      __publicField(this, "footerPrevBtn");
+      __publicField(this, "footerNextBtn");
+      __publicField(this, "relocateBtn");
+      __publicField(this, "miniBarEl");
+      __publicField(this, "miniPlayBtn");
+      __publicField(this, "miniPlayIcon");
+      __publicField(this, "miniProgressEl");
+      __publicField(this, "topBarEl");
+      __publicField(this, "topTitleEl");
+      __publicField(this, "jumpBtn");
+      __publicField(this, "bottomDockEl");
+      __publicField(this, "panelAppearanceEl");
+      __publicField(this, "panelTtsEl");
+      __publicField(this, "panelWorkerEl");
+      __publicField(this, "fontValEl");
+      __publicField(this, "autoEnterInput");
+      __publicField(this, "ttsProgressEl");
+      __publicField(this, "ttsPlayBtn");
+      __publicField(this, "ttsPlayIcon");
+      __publicField(this, "rateBtn");
+      __publicField(this, "voiceSelect");
+      __publicField(this, "workerInput");
+      __publicField(this, "tokenInput");
+      __publicField(this, "testBtn");
+      __publicField(this, "testResultEl");
+      __publicField(this, "dockPrevChBtn");
+      __publicField(this, "dockTtsBtn");
+      __publicField(this, "dockAppearanceBtn");
+      __publicField(this, "dockNextChBtn");
+      this.events = events;
+      this.settings = { ...config.reader };
+      this.currentRate = config.rate;
+      this.host = document.createElement("novel-tts-reader-host");
+      this.host.id = "novel-tts-reader-root";
+      this.applyHostStyles();
+      this.shadow = this.host.attachShadow({ mode: "open" });
+      this.render(config);
+      this.applySettings(this.settings);
+      this.bindEvents();
+    }
+    applyHostStyles() {
+      this.host.style.setProperty("position", "fixed", "important");
+      this.host.style.setProperty("inset", "0", "important");
+      this.host.style.setProperty("z-index", "2147483645", "important");
+      this.host.style.setProperty("display", "none", "important");
+      this.host.style.setProperty("margin", "0", "important");
+      this.host.style.setProperty("padding", "0", "important");
+      this.host.style.setProperty("border", "0", "important");
+      this.host.style.setProperty("background", "transparent", "important");
+    }
+    mount(parent) {
+      const target = parent || document.documentElement || document.body;
+      if (target && !target.contains(this.host)) {
+        target.appendChild(this.host);
+      }
+    }
+    unmount() {
+      this.clearSingleTapTimer();
+      this.restorePageOverflow();
+      if (this.host.parentNode) {
+        this.host.parentNode.removeChild(this.host);
+      }
+    }
+    isOpen() {
+      return this.opened;
+    }
+    open() {
+      if (this.opened) return;
+      this.opened = true;
+      this.mount();
+      if (typeof document !== "undefined") {
+        this.savedHtmlOverflow = document.documentElement.style.overflow;
+        document.documentElement.style.overflow = "hidden";
+        if (document.body) {
+          this.savedBodyOverflow = document.body.style.overflow;
+          document.body.style.overflow = "hidden";
+        }
+      }
+      this.host.style.setProperty("display", "block", "important");
+      this.setMenuOpen(false);
+      this.updateScrollStatus();
+      this.updateRelocateVisibility();
+    }
+    close() {
+      if (!this.opened) return;
+      this.opened = false;
+      this.clearSingleTapTimer();
+      this.setMenuOpen(false);
+      this.host.style.setProperty("display", "none", "important");
+      this.restorePageOverflow();
+    }
+    restorePageOverflow() {
+      if (typeof document === "undefined") return;
+      if (this.savedHtmlOverflow !== null) {
+        document.documentElement.style.overflow = this.savedHtmlOverflow;
+        this.savedHtmlOverflow = null;
+      }
+      if (this.savedBodyOverflow !== null && document.body) {
+        document.body.style.overflow = this.savedBodyOverflow;
+        this.savedBodyOverflow = null;
+      }
+    }
+    clearSingleTapTimer() {
+      if (this.singleTapTimer !== null) {
+        clearTimeout(this.singleTapTimer);
+        this.singleTapTimer = null;
+      }
+      this.lastTapChunkIdx = -1;
+      this.lastTapAt = 0;
+    }
+    notifyToast(message) {
+      var _a, _b;
+      (_b = (_a = this.events).onToast) == null ? void 0 : _b.call(_a, message);
+    }
+    // ─── 章节渲染与状态同步 ────────────────────────────────────────────────
+    renderChapter(chapter, chunks, chapterUrl) {
+      const title = chapter.title || "正文阅读";
+      this.statusTitleEl.textContent = title;
+      this.topTitleEl.textContent = title;
+      this.articleTitleEl.textContent = title;
+      this.currentChapterUrl = chapterUrl || null;
+      this.jumpBtn.style.display = chapterUrl ? "inline-flex" : "none";
+      this.hasPrevChapter = Boolean(chapter.prevChapterUrl);
+      this.hasNextChapter = Boolean(chapter.nextChapterUrl);
+      this.updateChapterButtonsDisabled();
+      this.totalChunks = chunks.length;
+      this.activeChunkIndex = -1;
+      this.lastUserScrollAt = 0;
+      const segmentsByParagraph = /* @__PURE__ */ new Map();
+      for (const chunk of chunks) {
+        for (const seg of chunk.segments) {
+          let list = segmentsByParagraph.get(seg.paragraphIndex);
+          if (!list) {
+            list = [];
+            segmentsByParagraph.set(seg.paragraphIndex, list);
+          }
+          list.push({ chunkIndex: chunk.index, text: seg.text });
+        }
+      }
+      const fragment = document.createDocumentFragment();
+      chapter.paragraphs.forEach((paraText, pIdx) => {
+        const pEl = document.createElement("p");
+        pEl.className = "reader-p";
+        const segs = segmentsByParagraph.get(pIdx);
+        if (segs && segs.length > 0) {
+          for (const seg of segs) {
+            const span = document.createElement("span");
+            span.className = "reader-sentence";
+            span.setAttribute("data-chunk-index", String(seg.chunkIndex));
+            span.textContent = seg.text;
+            pEl.appendChild(span);
+          }
+        } else {
+          pEl.textContent = paraText;
+        }
+        fragment.appendChild(pEl);
+      });
+      this.articleBodyEl.replaceChildren(fragment);
+      this.programmaticScrollUntil = Date.now() + 300;
+      this.scrollEl.scrollTop = 0;
+      this.updateScrollStatus();
+      this.updateRelocateVisibility();
+    }
+    setActiveChunk(index) {
+      this.activeChunkIndex = index;
+      const prevActives = this.articleBodyEl.querySelectorAll(".reader-sentence.active");
+      prevActives.forEach((el) => el.classList.remove("active"));
+      if (index < 0) {
+        this.updateRelocateVisibility();
+        this.updateScrollStatus();
+        return;
+      }
+      const targets = this.articleBodyEl.querySelectorAll(
+        `.reader-sentence[data-chunk-index="${index}"]`
+      );
+      targets.forEach((el) => el.classList.add("active"));
+      const firstEl = targets[0];
+      if (firstEl && Date.now() - this.lastUserScrollAt > USER_SCROLL_PROTECT_MS$1) {
+        this.scrollToSentenceEl(firstEl);
+      }
+      this.updateScrollStatus();
+      this.updateRelocateVisibility();
+    }
+    scrollToSentenceEl(el) {
+      const scrollRect = this.scrollEl.getBoundingClientRect();
+      const elRect = el.getBoundingClientRect();
+      if (scrollRect.height <= 0) {
+        try {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+        } catch {
+        }
+        return;
+      }
+      const offsetTop = elRect.top - scrollRect.top + this.scrollEl.scrollTop;
+      const targetTop = Math.max(0, offsetTop - scrollRect.height * 0.38);
+      this.programmaticScrollUntil = Date.now() + 700;
+      if (typeof this.scrollEl.scrollTo === "function") {
+        try {
+          this.scrollEl.scrollTo({ top: targetTop, behavior: "smooth" });
+        } catch {
+          this.scrollEl.scrollTop = targetTop;
+        }
+      } else {
+        this.scrollEl.scrollTop = targetTop;
+      }
+    }
+    setChapterLoading(loading) {
+      this.isChapterLoading = loading;
+      this.updateChapterButtonsDisabled();
+    }
+    updateChapterButtonsDisabled() {
+      const prevDisabled = this.isChapterLoading || !this.hasPrevChapter;
+      const nextDisabled = this.isChapterLoading || !this.hasNextChapter;
+      this.footerPrevBtn.disabled = prevDisabled;
+      this.dockPrevChBtn.disabled = prevDisabled;
+      this.footerNextBtn.disabled = nextDisabled;
+      this.dockNextChBtn.disabled = nextDisabled;
+    }
+    updatePlayerState(state) {
+      this.playerState = state;
+      const playIconPath = state === "playing" ? SVG_PAUSE_PATH : SVG_PLAY_PATH;
+      const playLabel = state === "playing" ? "暂停" : state === "loading" ? "加载中…" : "播放";
+      this.miniPlayIcon.innerHTML = playIconPath;
+      this.miniPlayBtn.title = playLabel;
+      this.ttsPlayIcon.innerHTML = playIconPath;
+      this.ttsPlayBtn.title = playLabel;
+      this.dockTtsBtn.classList.toggle("is-playing", this.isTtsActive());
+      this.updateMiniBarVisibility();
+      this.updateScrollStatus();
+      this.updateRelocateVisibility();
+    }
+    updateProgress(index, total) {
+      this.totalChunks = total;
+      const text = total > 0 ? `${index + 1} / ${total}` : "0 / 0";
+      this.miniProgressEl.textContent = text;
+      this.ttsProgressEl.textContent = total > 0 ? `第 ${index + 1} / ${total} 句` : "0 / 0";
+      this.updateScrollStatus();
+    }
+    syncRate(rate) {
+      this.currentRate = rate;
+      this.rateBtn.textContent = `${rate.toFixed(1)}x`;
+    }
+    syncVoice(voice) {
+      this.voiceSelect.value = voice;
+    }
+    syncConfigInputs(workerUrl, token) {
+      this.workerInput.value = workerUrl;
+      this.tokenInput.value = token;
+    }
+    applySettings(settings) {
+      this.settings = { ...settings };
+      this.rootEl.setAttribute("data-theme", settings.theme);
+      this.rootEl.style.setProperty("--reader-font-size", `${settings.fontSize}px`);
+      this.rootEl.style.setProperty("--reader-line-height", String(settings.lineHeight));
+      this.fontValEl.textContent = `${settings.fontSize}px`;
+      this.autoEnterInput.checked = Boolean(settings.autoEnter);
+      this.shadow.querySelectorAll("[data-theme-opt]").forEach((btn) => {
+        btn.classList.toggle("active", btn.dataset.themeOpt === settings.theme);
+      });
+      this.shadow.querySelectorAll("[data-line-height]").forEach((btn) => {
+        const val = Number.parseFloat(btn.dataset.lineHeight || "0");
+        btn.classList.toggle("active", Math.abs(val - settings.lineHeight) < 0.05);
+      });
+    }
+    isTtsActive() {
+      return this.playerState === "playing" || this.playerState === "loading" || this.playerState === "paused";
+    }
+    updateMiniBarVisibility() {
+      const show = this.isTtsActive() && !this.isMenuOpen;
+      this.miniBarEl.classList.toggle("visible", show);
+    }
+    updateScrollStatus() {
+      if (this.isTtsActive() && this.totalChunks > 0 && this.activeChunkIndex >= 0) {
+        this.statusProgressEl.textContent = `🔊 ${this.activeChunkIndex + 1} / ${this.totalChunks}`;
+        return;
+      }
+      const maxScroll = Math.max(0, this.scrollEl.scrollHeight - this.scrollEl.clientHeight);
+      if (maxScroll <= 0) {
+        this.statusProgressEl.textContent = "0%";
+        return;
+      }
+      const pct = Math.max(
+        0,
+        Math.min(100, Math.round(this.scrollEl.scrollTop / maxScroll * 100))
+      );
+      this.statusProgressEl.textContent = `${pct}%`;
+    }
+    updateRelocateVisibility() {
+      if (!this.isTtsActive() || this.activeChunkIndex < 0) {
+        this.relocateBtn.classList.remove("visible");
+        return;
+      }
+      const activeEl = this.articleBodyEl.querySelector(
+        `.reader-sentence[data-chunk-index="${this.activeChunkIndex}"]`
+      );
+      if (!activeEl) {
+        this.relocateBtn.classList.remove("visible");
+        return;
+      }
+      const scrollRect = this.scrollEl.getBoundingClientRect();
+      if (scrollRect.height <= 0) {
+        this.relocateBtn.classList.remove("visible");
+        return;
+      }
+      const elRect = activeEl.getBoundingClientRect();
+      const outOfView = elRect.bottom < scrollRect.top + 36 || elRect.top > scrollRect.bottom - 36;
+      this.relocateBtn.classList.toggle("visible", outOfView);
+    }
+    setMenuOpen(open, initialPanel = "none") {
+      this.isMenuOpen = open;
+      this.topBarEl.classList.toggle("open", open);
+      this.bottomDockEl.classList.toggle("open", open);
+      this.setSubpanel(open ? initialPanel : "none");
+      this.updateMiniBarVisibility();
+    }
+    setSubpanel(panel) {
+      this.activeSubpanel = panel;
+      this.panelAppearanceEl.classList.toggle("open", panel === "appearance");
+      this.panelTtsEl.classList.toggle("open", panel === "tts");
+      this.panelWorkerEl.classList.toggle("open", panel === "worker");
+      this.dockAppearanceBtn.classList.toggle("active", panel === "appearance");
+      this.dockTtsBtn.classList.toggle("active", panel === "tts");
+    }
+    updateSettings(patch) {
+      const next = { ...this.settings, ...patch };
+      this.applySettings(next);
+      this.events.onSettingsChange(patch);
+    }
+    // ─── DOM 渲染 ──────────────────────────────────────────────────────────
+    render(config) {
+      const style = document.createElement("style");
+      style.textContent = `
+      :host {
+        all: initial;
+        font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Segoe UI", Roboto, sans-serif;
+        -webkit-tap-highlight-color: transparent;
+      }
+
+      .reader-root {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        background: var(--bg);
+        color: var(--text);
+        --reader-font-size: 18px;
+        --reader-line-height: 1.85;
+      }
+
+      /* 4 套夸克风格主题 */
+      .reader-root[data-theme="light"] {
+        --bg: #f8fafc;
+        --surface: #ffffff;
+        --dock-bg: rgba(255, 255, 255, 0.96);
+        --text: #1e293b;
+        --muted: #64748b;
+        --border: rgba(15, 23, 42, 0.1);
+        --hl-bg: rgba(14, 165, 233, 0.2);
+        --hl-text: #0f172a;
+        --accent: #0284c7;
+        --btn-bg: rgba(15, 23, 42, 0.06);
+      }
+      .reader-root[data-theme="sepia"] {
+        --bg: #f4ecd8;
+        --surface: #efe4c8;
+        --dock-bg: rgba(246, 238, 218, 0.96);
+        --text: #3d3122;
+        --muted: #7c6950;
+        --border: rgba(61, 49, 34, 0.12);
+        --hl-bg: rgba(217, 119, 6, 0.22);
+        --hl-text: #291f14;
+        --accent: #b45309;
+        --btn-bg: rgba(61, 49, 34, 0.08);
+      }
+      .reader-root[data-theme="green"] {
+        --bg: #cce8cf;
+        --surface: #d8efd9;
+        --dock-bg: rgba(212, 238, 215, 0.96);
+        --text: #1e3322;
+        --muted: #4b6950;
+        --border: rgba(30, 51, 34, 0.12);
+        --hl-bg: rgba(16, 185, 129, 0.26);
+        --hl-text: #0f2414;
+        --accent: #059669;
+        --btn-bg: rgba(30, 51, 34, 0.08);
+      }
+      .reader-root[data-theme="dark"] {
+        --bg: #12151c;
+        --surface: #1a1f29;
+        --dock-bg: rgba(20, 25, 36, 0.96);
+        --text: #cbd5e1;
+        --muted: #64748b;
+        --border: rgba(255, 255, 255, 0.1);
+        --hl-bg: rgba(56, 189, 248, 0.22);
+        --hl-text: #f8fafc;
+        --accent: #38bdf8;
+        --btn-bg: rgba(255, 255, 255, 0.08);
+      }
+
+      /* 顶部常驻极简微状态栏 */
+      .status-header {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: calc(30px + env(safe-area-inset-top, 0px));
+        padding: env(safe-area-inset-top, 0px) 18px 0;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        font-size: 11px;
+        color: var(--muted);
+        background: var(--bg);
+        z-index: 2;
+        pointer-events: none;
+        box-sizing: border-box;
+      }
+      .status-title {
+        min-width: 0;
+        flex: 1;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .status-progress {
+        flex-shrink: 0;
+        font-variant-numeric: tabular-nums;
+      }
+
+      /* 竖向滚动正文区 */
+      .reader-scroll {
+        flex: 1;
+        overflow-y: auto;
+        -webkit-overflow-scrolling: touch;
+        overscroll-behavior: contain;
+        touch-action: manipulation;
+      }
+      .reader-article {
+        max-width: 720px;
+        margin: 0 auto;
+        padding: calc(44px + env(safe-area-inset-top, 0px)) 20px calc(110px + env(safe-area-inset-bottom, 0px));
+        box-sizing: border-box;
+      }
+      .reader-chapter-title {
+        font-size: calc(var(--reader-font-size) + 4px);
+        line-height: 1.4;
+        font-weight: 700;
+        margin: 0 0 22px;
+        color: var(--hl-text);
+      }
+      .reader-p {
+        margin: 0 0 0.85em;
+        font-size: var(--reader-font-size);
+        line-height: var(--reader-line-height);
+        text-indent: 2em;
+        word-break: break-word;
+      }
+      .reader-sentence {
+        border-radius: 3px;
+        transition: background-color 0.2s, color 0.2s;
+      }
+      .reader-sentence.active {
+        background: var(--hl-bg);
+        color: var(--hl-text);
+        box-shadow: 0 0 0 2px var(--hl-bg);
+      }
+
+      /* 章节底部上下章翻页按钮 */
+      .reader-footer-nav {
+        display: flex;
+        gap: 12px;
+        margin-top: 32px;
+        padding-top: 20px;
+        border-top: 1px solid var(--border);
+      }
+      .footer-nav-btn {
+        flex: 1;
+        height: 44px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: var(--btn-bg);
+        color: var(--text);
+        font-size: 14px;
+        font-weight: 500;
+        cursor: pointer;
+      }
+      .footer-nav-btn.primary {
+        border-color: var(--accent);
+        color: var(--accent);
+      }
+      .footer-nav-btn:disabled {
+        opacity: 0.35;
+        cursor: not-allowed;
+      }
+
+      /* 回到朗读处浮动胶囊 */
+      .relocate-btn {
+        position: fixed;
+        right: 16px;
+        bottom: calc(74px + env(safe-area-inset-bottom, 0px));
+        padding: 7px 12px;
+        border-radius: 18px;
+        border: 1px solid var(--accent);
+        background: var(--dock-bg);
+        color: var(--accent);
+        font-size: 12px;
+        font-weight: 500;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+        cursor: pointer;
+        opacity: 0;
+        pointer-events: none;
+        transform: translateY(8px);
+        transition: opacity 0.2s, transform 0.2s;
+        z-index: 4;
+      }
+      .relocate-btn.visible {
+        opacity: 1;
+        pointer-events: auto;
+        transform: translateY(0);
+      }
+
+      /* 迷你底部听书栏 (无正文文字预览，仅控播与进度) */
+      .mini-tts-bar {
+        position: fixed;
+        left: 12px;
+        right: 12px;
+        bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+        height: 48px;
+        padding: 0 12px;
+        border-radius: 24px;
+        background: var(--dock-bg);
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+        border: 1px solid var(--border);
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.2);
+        display: none;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        z-index: 4;
+        box-sizing: border-box;
+      }
+      .mini-tts-bar.visible {
+        display: flex;
+      }
+      .mini-controls {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .mini-btn {
+        width: 34px;
+        height: 34px;
+        border-radius: 50%;
+        border: none;
+        background: var(--btn-bg);
+        color: var(--text);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+      }
+      .mini-btn.primary {
+        background: var(--accent);
+        color: #ffffff;
+      }
+      .mini-btn svg {
+        fill: currentColor;
+      }
+      .mini-progress {
+        font-size: 12px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+
+      /* 仿夸克滑出顶栏 */
+      .top-bar {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        padding: calc(10px + env(safe-area-inset-top, 0px)) 14px 10px;
+        background: var(--dock-bg);
+        backdrop-filter: blur(18px);
+        -webkit-backdrop-filter: blur(18px);
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        transform: translateY(-105%);
+        transition: transform 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+        z-index: 6;
+        box-sizing: border-box;
+      }
+      .top-bar.open {
+        transform: translateY(0);
+      }
+      .top-title {
+        flex: 1;
+        min-width: 0;
+        text-align: center;
+        font-size: 14px;
+        font-weight: 600;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .bar-text-btn {
+        border: none;
+        background: none;
+        color: var(--text);
+        font-size: 13px;
+        padding: 5px 8px;
+        border-radius: 6px;
+        cursor: pointer;
+        flex-shrink: 0;
+      }
+      .bar-text-btn.accent {
+        color: var(--accent);
+        background: var(--btn-bg);
+        font-size: 12px;
+      }
+
+      /* 仿夸克滑出底栏 */
+      .bottom-dock {
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        padding: 10px 14px calc(10px + env(safe-area-inset-bottom, 0px));
+        background: var(--dock-bg);
+        backdrop-filter: blur(18px);
+        -webkit-backdrop-filter: blur(18px);
+        border-top: 1px solid var(--border);
+        box-shadow: 0 -8px 28px rgba(0, 0, 0, 0.18);
+        transform: translateY(105%);
+        transition: transform 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+        z-index: 6;
+        box-sizing: border-box;
+      }
+      .bottom-dock.open {
+        transform: translateY(0);
+      }
+
+      .subpanel {
+        display: none;
+        padding-bottom: 12px;
+        margin-bottom: 10px;
+        border-bottom: 1px solid var(--border);
+      }
+      .subpanel.open {
+        display: block;
+      }
+
+      /* 排版设置行 */
+      .setting-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 10px;
+      }
+      .setting-row:last-child {
+        margin-bottom: 0;
+      }
+      .setting-label {
+        font-size: 12px;
+        color: var(--muted);
+        flex-shrink: 0;
+      }
+      .btn-group {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex: 1;
+        justify-content: flex-end;
+      }
+      .pill-btn {
+        border: 1px solid var(--border);
+        background: var(--btn-bg);
+        color: var(--text);
+        font-size: 12px;
+        padding: 5px 12px;
+        border-radius: 14px;
+        cursor: pointer;
+      }
+      .pill-btn.active {
+        border-color: var(--accent);
+        color: var(--accent);
+        font-weight: 600;
+      }
+      .font-val {
+        font-size: 13px;
+        min-width: 40px;
+        text-align: center;
+        font-variant-numeric: tabular-nums;
+      }
+      .theme-swatch {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 5px 9px;
+        border-radius: 12px;
+        border: 1px solid var(--border);
+        background: var(--btn-bg);
+        color: var(--text);
+        font-size: 11px;
+        cursor: pointer;
+      }
+      .theme-swatch.active {
+        border-color: var(--accent);
+        color: var(--accent);
+        font-weight: 600;
+      }
+      .swatch-dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        border: 1px solid rgba(128, 128, 128, 0.35);
+      }
+      .switch-label {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        color: var(--text);
+        cursor: pointer;
+      }
+
+      /* 听书设置子面板 (无正文预览框) */
+      .tts-info-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 10px;
+      }
+      .tts-controls-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-around;
+        margin-bottom: 10px;
+      }
+      .tts-btn {
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        border: none;
+        background: var(--btn-bg);
+        color: var(--text);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+      }
+      .tts-btn.primary {
+        width: 50px;
+        height: 50px;
+        background: var(--accent);
+        color: #ffffff;
+      }
+      .tts-btn svg {
+        fill: currentColor;
+      }
+      .tts-params-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .voice-select {
+        background: var(--btn-bg);
+        border: 1px solid var(--border);
+        color: var(--text);
+        font-size: 12px;
+        padding: 5px 8px;
+        border-radius: 8px;
+        outline: none;
+        max-width: 135px;
+      }
+      .voice-select option {
+        background: var(--surface);
+        color: var(--text);
+      }
+
+      /* Worker 配置子面板 */
+      .field {
+        margin-bottom: 8px;
+      }
+      .field label {
+        display: block;
+        font-size: 11px;
+        color: var(--muted);
+        margin-bottom: 4px;
+      }
+      .field input {
+        width: 100%;
+        box-sizing: border-box;
+        background: var(--btn-bg);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 6px 10px;
+        color: var(--text);
+        font-size: 12px;
+        outline: none;
+      }
+      .worker-btn-row {
+        display: flex;
+        gap: 8px;
+      }
+      .save-btn {
+        flex: 1;
+        background: var(--accent);
+        color: #ffffff;
+        border: none;
+        padding: 7px;
+        border-radius: 6px;
+        font-size: 12px;
+        font-weight: 500;
+        cursor: pointer;
+      }
+      .test-btn {
+        flex: 1;
+        background: var(--btn-bg);
+        color: var(--accent);
+        border: 1px solid var(--accent);
+        padding: 7px;
+        border-radius: 6px;
+        font-size: 12px;
+        font-weight: 500;
+        cursor: pointer;
+      }
+      .test-result {
+        display: none;
+        margin-top: 8px;
+        padding: 6px 10px;
+        border-radius: 6px;
+        font-size: 11px;
+        line-height: 1.4;
+      }
+      .test-result.success {
+        display: block;
+        background: rgba(34, 197, 94, 0.15);
+        border: 1px solid rgba(34, 197, 94, 0.35);
+        color: #16a34a;
+      }
+      .test-result.error {
+        display: block;
+        background: rgba(239, 68, 68, 0.15);
+        border: 1px solid rgba(239, 68, 68, 0.35);
+        color: #dc2626;
+      }
+
+      /* 底层 4 键主操作栏 */
+      .dock-actions {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 6px;
+      }
+      .dock-btn {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 2px;
+        padding: 6px 4px;
+        border: none;
+        border-radius: 8px;
+        background: none;
+        color: var(--text);
+        font-size: 11px;
+        cursor: pointer;
+      }
+      .dock-btn.active,
+      .dock-btn.is-playing {
+        color: var(--accent);
+        font-weight: 600;
+      }
+      .dock-btn:disabled {
+        opacity: 0.35;
+        cursor: not-allowed;
+      }
+    `;
+      const lineHeightButtonsHtml = LINE_HEIGHT_PRESETS.map(
+        (p) => `<button class="pill-btn" data-line-height="${p.value}">${p.label} (${p.value})</button>`
+      ).join("");
+      const themeButtonsHtml = THEME_PRESETS.map(
+        (t) => `<button class="theme-swatch" data-theme-opt="${t.value}"><span class="swatch-dot" style="background:${t.swatch}"></span><span>${t.label}</span></button>`
+      ).join("");
+      const root = document.createElement("div");
+      root.className = "reader-root";
+      root.innerHTML = `
+      <div class="status-header">
+        <span class="status-title" id="rv-status-title">阅读模式</span>
+        <span class="status-progress" id="rv-status-progress">0%</span>
+      </div>
+
+      <div class="reader-scroll" id="rv-scroll">
+        <article class="reader-article">
+          <h1 class="reader-chapter-title" id="rv-article-title"></h1>
+          <div class="reader-body" id="rv-article-body"></div>
+          <div class="reader-footer-nav">
+            <button class="footer-nav-btn" id="rv-footer-prev">上一章</button>
+            <button class="footer-nav-btn primary" id="rv-footer-next">下一章</button>
+          </div>
+        </article>
+      </div>
+
+      <button class="relocate-btn" id="rv-relocate">回到朗读处</button>
+
+      <div class="mini-tts-bar" id="rv-mini-bar">
+        <div class="mini-controls">
+          <button class="mini-btn" id="rv-mini-prev" title="上一句">
+            <svg width="16" height="16" viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg>
+          </button>
+          <button class="mini-btn primary" id="rv-mini-play" title="播放/暂停">
+            <svg width="18" height="18" viewBox="0 0 24 24" id="rv-mini-play-icon">${SVG_PLAY_PATH}</svg>
+          </button>
+          <button class="mini-btn" id="rv-mini-next" title="下一句">
+            <svg width="16" height="16" viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+          </button>
+        </div>
+        <span class="mini-progress" id="rv-mini-progress">0 / 0</span>
+        <button class="mini-btn" id="rv-mini-menu" title="展开菜单">
+          <svg width="18" height="18" viewBox="0 0 24 24"><path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/></svg>
+        </button>
+      </div>
+
+      <div class="top-bar" id="rv-top-bar">
+        <button class="bar-text-btn" id="rv-exit">← 退出阅读</button>
+        <span class="top-title" id="rv-top-title">阅读模式</span>
+        <button class="bar-text-btn accent" id="rv-jump" style="display:none">查看原文</button>
+        <button class="bar-text-btn" id="rv-top-worker" title="配置 Worker">⚙️</button>
+      </div>
+
+      <div class="bottom-dock" id="rv-bottom-dock">
+        <div class="subpanel" id="rv-panel-appearance">
+          <div class="setting-row">
+            <span class="setting-label">字号</span>
+            <div class="btn-group">
+              <button class="pill-btn" id="rv-font-dec">A-</button>
+              <span class="font-val" id="rv-font-val">18px</span>
+              <button class="pill-btn" id="rv-font-inc">A+</button>
+            </div>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">行距</span>
+            <div class="btn-group">${lineHeightButtonsHtml}</div>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">背景</span>
+            <div class="btn-group">${themeButtonsHtml}</div>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">偏好</span>
+            <label class="switch-label">
+              <input type="checkbox" id="rv-auto-enter" />
+              <span>打开小说页自动进入阅读模式</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="subpanel" id="rv-panel-tts">
+          <div class="tts-info-row">
+            <span id="rv-tts-progress">0 / 0</span>
+            <span>双击正文任意句可从该处朗读</span>
+          </div>
+          <div class="tts-controls-row">
+            <button class="tts-btn" id="rv-tts-prev" title="上一句">
+              <svg width="20" height="20" viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg>
+            </button>
+            <button class="tts-btn primary" id="rv-tts-play" title="播放/暂停">
+              <svg width="24" height="24" viewBox="0 0 24 24" id="rv-tts-play-icon">${SVG_PLAY_PATH}</svg>
+            </button>
+            <button class="tts-btn" id="rv-tts-next" title="下一句">
+              <svg width="20" height="20" viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+            </button>
+            <button class="tts-btn" id="rv-tts-stop" title="停止朗读">
+              <svg width="18" height="18" viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>
+            </button>
+          </div>
+          <div class="tts-params-row">
+            <button class="pill-btn" id="rv-rate">${config.rate.toFixed(1)}x</button>
+            <select class="voice-select" id="rv-voice">${buildVoiceOptionsHtml()}</select>
+            <button class="pill-btn" id="rv-open-worker">Worker配置</button>
+          </div>
+        </div>
+
+        <div class="subpanel" id="rv-panel-worker">
+          <div class="field">
+            <label>Edge TTS Worker 地址 (URL)</label>
+            <input type="text" id="rv-worker-url" placeholder="https://xxx.workers.dev 或 http://localhost:8787" />
+          </div>
+          <div class="field">
+            <label>Worker 鉴权密钥 (Token，默认 dev-secret)</label>
+            <input type="text" id="rv-token" placeholder="dev-secret" />
+          </div>
+          <div class="worker-btn-row">
+            <button class="save-btn" id="rv-save-config">保存配置</button>
+            <button class="test-btn" id="rv-test-config">测试连接</button>
+          </div>
+          <div class="test-result" id="rv-test-result"></div>
+        </div>
+
+        <div class="dock-actions">
+          <button class="dock-btn" id="rv-dock-prev-ch">上一章</button>
+          <button class="dock-btn" id="rv-dock-tts">听书</button>
+          <button class="dock-btn" id="rv-dock-appearance">设置</button>
+          <button class="dock-btn" id="rv-dock-next-ch">下一章</button>
+        </div>
+      </div>
+    `;
+      this.shadow.appendChild(style);
+      this.shadow.appendChild(root);
+      this.rootEl = root;
+      this.scrollEl = this.shadow.querySelector("#rv-scroll");
+      this.statusTitleEl = this.shadow.querySelector("#rv-status-title");
+      this.statusProgressEl = this.shadow.querySelector("#rv-status-progress");
+      this.articleTitleEl = this.shadow.querySelector("#rv-article-title");
+      this.articleBodyEl = this.shadow.querySelector("#rv-article-body");
+      this.footerPrevBtn = this.shadow.querySelector("#rv-footer-prev");
+      this.footerNextBtn = this.shadow.querySelector("#rv-footer-next");
+      this.relocateBtn = this.shadow.querySelector("#rv-relocate");
+      this.miniBarEl = this.shadow.querySelector("#rv-mini-bar");
+      this.miniPlayBtn = this.shadow.querySelector("#rv-mini-play");
+      this.miniPlayIcon = this.shadow.querySelector("#rv-mini-play-icon");
+      this.miniProgressEl = this.shadow.querySelector("#rv-mini-progress");
+      this.topBarEl = this.shadow.querySelector("#rv-top-bar");
+      this.topTitleEl = this.shadow.querySelector("#rv-top-title");
+      this.jumpBtn = this.shadow.querySelector("#rv-jump");
+      this.bottomDockEl = this.shadow.querySelector("#rv-bottom-dock");
+      this.panelAppearanceEl = this.shadow.querySelector("#rv-panel-appearance");
+      this.panelTtsEl = this.shadow.querySelector("#rv-panel-tts");
+      this.panelWorkerEl = this.shadow.querySelector("#rv-panel-worker");
+      this.fontValEl = this.shadow.querySelector("#rv-font-val");
+      this.autoEnterInput = this.shadow.querySelector("#rv-auto-enter");
+      this.ttsProgressEl = this.shadow.querySelector("#rv-tts-progress");
+      this.ttsPlayBtn = this.shadow.querySelector("#rv-tts-play");
+      this.ttsPlayIcon = this.shadow.querySelector("#rv-tts-play-icon");
+      this.rateBtn = this.shadow.querySelector("#rv-rate");
+      this.voiceSelect = this.shadow.querySelector("#rv-voice");
+      this.workerInput = this.shadow.querySelector("#rv-worker-url");
+      this.tokenInput = this.shadow.querySelector("#rv-token");
+      this.testBtn = this.shadow.querySelector("#rv-test-config");
+      this.testResultEl = this.shadow.querySelector("#rv-test-result");
+      this.dockPrevChBtn = this.shadow.querySelector("#rv-dock-prev-ch");
+      this.dockTtsBtn = this.shadow.querySelector("#rv-dock-tts");
+      this.dockAppearanceBtn = this.shadow.querySelector("#rv-dock-appearance");
+      this.dockNextChBtn = this.shadow.querySelector("#rv-dock-next-ch");
+      this.workerInput.value = config.workerUrl;
+      this.tokenInput.value = config.token;
+      this.voiceSelect.value = config.voice;
+    }
+    // ─── 事件绑定 ──────────────────────────────────────────────────────────
+    bindEvents() {
+      const markUserScroll = () => {
+        this.lastUserScrollAt = Date.now();
+      };
+      this.scrollEl.addEventListener("touchstart", markUserScroll, { passive: true });
+      this.scrollEl.addEventListener("wheel", markUserScroll, { passive: true });
+      this.scrollEl.addEventListener("scroll", () => {
+        if (Date.now() > this.programmaticScrollUntil) {
+          this.lastUserScrollAt = Date.now();
+        }
+        this.updateScrollStatus();
+        this.updateRelocateVisibility();
+      });
+      let downX = 0;
+      let downY = 0;
+      let pointerMoved = false;
+      this.scrollEl.addEventListener(
+        "touchstart",
+        (e) => {
+          if (e.touches.length === 1) {
+            downX = e.touches[0].clientX;
+            downY = e.touches[0].clientY;
+            pointerMoved = false;
+          }
+        },
+        { passive: true }
+      );
+      this.scrollEl.addEventListener(
+        "touchmove",
+        (e) => {
+          if (e.touches.length === 1) {
+            if (Math.hypot(e.touches[0].clientX - downX, e.touches[0].clientY - downY) > 10) {
+              pointerMoved = true;
+            }
+          }
+        },
+        { passive: true }
+      );
+      this.scrollEl.addEventListener("mousedown", (e) => {
+        downX = e.clientX;
+        downY = e.clientY;
+        pointerMoved = false;
+      });
+      this.scrollEl.addEventListener("mousemove", (e) => {
+        if (e.buttons && Math.hypot(e.clientX - downX, e.clientY - downY) > 10) {
+          pointerMoved = true;
+        }
+      });
+      this.scrollEl.addEventListener("click", (e) => {
+        var _a;
+        if (pointerMoved) {
+          pointerMoved = false;
+          return;
+        }
+        try {
+          if ((_a = window.getSelection()) == null ? void 0 : _a.toString().trim()) {
+            return;
+          }
+        } catch {
+        }
+        const target = e.target;
+        if (!target || target.closest(".reader-footer-nav, button, a, input, select")) {
+          return;
+        }
+        if (this.isMenuOpen) {
+          this.clearSingleTapTimer();
+          this.setMenuOpen(false);
+          return;
+        }
+        const sentenceEl = target.closest(".reader-sentence[data-chunk-index]");
+        if (!sentenceEl) {
+          this.clearSingleTapTimer();
+          this.setMenuOpen(true);
+          return;
+        }
+        const chunkIdx = Number.parseInt(sentenceEl.getAttribute("data-chunk-index") || "", 10);
+        if (!Number.isFinite(chunkIdx) || chunkIdx < 0) {
+          this.setMenuOpen(true);
+          return;
+        }
+        const now = Date.now();
+        if (this.lastTapChunkIdx === chunkIdx && now - this.lastTapAt <= 320) {
+          this.clearSingleTapTimer();
+          this.events.onSeekSentence(chunkIdx);
+          return;
+        }
+        this.clearSingleTapTimer();
+        this.lastTapChunkIdx = chunkIdx;
+        this.lastTapAt = now;
+        this.singleTapTimer = setTimeout(() => {
+          this.singleTapTimer = null;
+          this.lastTapChunkIdx = -1;
+          if (this.opened && !this.isMenuOpen) {
+            this.setMenuOpen(true);
+          }
+        }, 240);
+      });
+      this.relocateBtn.addEventListener("click", () => {
+        this.lastUserScrollAt = 0;
+        const activeEl = this.articleBodyEl.querySelector(
+          `.reader-sentence[data-chunk-index="${this.activeChunkIndex}"]`
+        );
+        if (activeEl) {
+          this.scrollToSentenceEl(activeEl);
+        }
+        this.relocateBtn.classList.remove("visible");
+      });
+      this.shadow.querySelector("#rv-exit").addEventListener("click", () => {
+        this.events.onClose();
+      });
+      this.jumpBtn.addEventListener("click", () => {
+        if (this.currentChapterUrl) {
+          this.events.onJumpChapterUrl(this.currentChapterUrl);
+        }
+      });
+      this.shadow.querySelector("#rv-top-worker").addEventListener("click", () => {
+        this.setSubpanel(this.activeSubpanel === "worker" ? "none" : "worker");
+      });
+      this.shadow.querySelector("#rv-mini-prev").addEventListener("click", () => {
+        this.events.onPrevSentence();
+      });
+      this.miniPlayBtn.addEventListener("click", () => {
+        this.events.onPlayToggle();
+      });
+      this.shadow.querySelector("#rv-mini-next").addEventListener("click", () => {
+        this.events.onNextSentence();
+      });
+      this.shadow.querySelector("#rv-mini-menu").addEventListener("click", () => {
+        this.setMenuOpen(true, "tts");
+      });
+      this.shadow.querySelector("#rv-font-dec").addEventListener("click", () => {
+        this.updateSettings({ fontSize: Math.max(14, this.settings.fontSize - 2) });
+      });
+      this.shadow.querySelector("#rv-font-inc").addEventListener("click", () => {
+        this.updateSettings({ fontSize: Math.min(28, this.settings.fontSize + 2) });
+      });
+      this.shadow.querySelectorAll("[data-line-height]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const val = Number.parseFloat(btn.dataset.lineHeight || "1.85");
+          if (Number.isFinite(val)) {
+            this.updateSettings({ lineHeight: val });
+          }
+        });
+      });
+      this.shadow.querySelectorAll("[data-theme-opt]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const theme = btn.dataset.themeOpt;
+          if (theme) {
+            this.updateSettings({ theme });
+          }
+        });
+      });
+      this.autoEnterInput.addEventListener("change", () => {
+        this.updateSettings({ autoEnter: this.autoEnterInput.checked });
+      });
+      this.shadow.querySelector("#rv-tts-prev").addEventListener("click", () => {
+        this.events.onPrevSentence();
+      });
+      this.ttsPlayBtn.addEventListener("click", () => {
+        this.events.onPlayToggle();
+      });
+      this.shadow.querySelector("#rv-tts-next").addEventListener("click", () => {
+        this.events.onNextSentence();
+      });
+      this.shadow.querySelector("#rv-tts-stop").addEventListener("click", () => {
+        this.events.onStop();
+      });
+      this.rateBtn.addEventListener("click", () => {
+        this.currentRate = getNextRate(this.currentRate);
+        this.rateBtn.textContent = `${this.currentRate.toFixed(1)}x`;
+        this.events.onRateChange(this.currentRate);
+        this.notifyToast(`语速已切换为 ${this.currentRate.toFixed(1)}x`);
+      });
+      this.voiceSelect.addEventListener("change", () => {
+        this.events.onVoiceChange(this.voiceSelect.value);
+        this.notifyToast("音色已更新");
+      });
+      this.shadow.querySelector("#rv-open-worker").addEventListener("click", () => {
+        this.setSubpanel("worker");
+      });
+      this.shadow.querySelector("#rv-save-config").addEventListener("click", () => {
+        const url = this.workerInput.value.trim();
+        const token = this.tokenInput.value.trim();
+        this.events.onSaveConfig(url, token);
+        this.setSubpanel("tts");
+      });
+      this.testBtn.addEventListener("click", () => {
+        void executeConnectionTest({
+          urlInput: this.workerInput,
+          tokenInput: this.tokenInput,
+          testBtn: this.testBtn,
+          resultEl: this.testResultEl,
+          onTest: (url, token) => this.events.onTestConfig(url, token),
+          onEmptyUrl: () => this.notifyToast("请先输入 Worker 地址")
+        });
+      });
+      this.footerPrevBtn.addEventListener("click", () => this.events.onPrevChapter());
+      this.footerNextBtn.addEventListener("click", () => this.events.onNextChapter());
+      this.dockPrevChBtn.addEventListener("click", () => {
+        this.setMenuOpen(false);
+        this.events.onPrevChapter();
+      });
+      this.dockNextChBtn.addEventListener("click", () => {
+        this.setMenuOpen(false);
+        this.events.onNextChapter();
+      });
+      this.dockTtsBtn.addEventListener("click", () => {
+        this.setSubpanel(this.activeSubpanel === "tts" ? "none" : "tts");
+      });
+      this.dockAppearanceBtn.addEventListener("click", () => {
+        this.setSubpanel(this.activeSubpanel === "appearance" ? "none" : "appearance");
+      });
+    }
+  }
+  const HIGHLIGHT_STYLE_ID = "novel-tts-page-highlight-style";
+  const HIGHLIGHT_CLASS = "novel-tts-active-mark";
+  const USER_SCROLL_PROTECT_MS = 3500;
+  const SKIP_ANCESTOR_SELECTOR = "script, style, noscript, textarea, input, select, option, novel-tts-host, novel-tts-reader-host";
+  function normalizeForMatch(raw) {
+    return raw.replace(/[\u200B-\u200D\uFEFF\s]+/g, "");
+  }
+  function isSkippableChar(ch) {
+    return /[\u200B-\u200D\uFEFF\s]/.test(ch);
+  }
+  class PageHighlighter {
+    constructor() {
+      __publicField(this, "container", null);
+      __publicField(this, "activeMarks", []);
+      __publicField(this, "lastMatchPos", 0);
+      __publicField(this, "lastUserScrollAt", 0);
+      __publicField(this, "onTouchStart");
+      __publicField(this, "onWheel");
+      this.onTouchStart = () => {
+        this.lastUserScrollAt = Date.now();
+      };
+      this.onWheel = () => {
+        this.lastUserScrollAt = Date.now();
+      };
+      if (typeof window !== "undefined") {
+        window.addEventListener("touchstart", this.onTouchStart, { passive: true });
+        window.addEventListener("wheel", this.onWheel, { passive: true });
+      }
+      this.ensureStyleInjected();
+    }
+    ensureStyleInjected() {
+      if (typeof document === "undefined") return;
+      if (document.getElementById(HIGHLIGHT_STYLE_ID)) return;
+      const target = document.head || document.documentElement;
+      if (!target) return;
+      const style = document.createElement("style");
+      style.id = HIGHLIGHT_STYLE_ID;
+      style.textContent = `
+      .${HIGHLIGHT_CLASS} {
+        background: rgba(56, 189, 248, 0.28) !important;
+        color: inherit !important;
+        border-radius: 3px !important;
+        box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.22) !important;
+      }
+    `;
+      target.appendChild(style);
+    }
+    setContainer(el) {
+      this.clear();
+      this.container = el;
+      this.lastMatchPos = 0;
+    }
+    resetPosition() {
+      this.clear();
+      this.lastMatchPos = 0;
+    }
+    clear() {
+      if (this.activeMarks.length === 0) return;
+      const parents = /* @__PURE__ */ new Set();
+      for (const mark of this.activeMarks) {
+        const parent = mark.parentNode;
+        if (!parent) continue;
+        parents.add(parent);
+        while (mark.firstChild) {
+          parent.insertBefore(mark.firstChild, mark);
+        }
+        parent.removeChild(mark);
+      }
+      this.activeMarks = [];
+      parents.forEach((parent) => {
+        if (typeof parent.normalize === "function") {
+          parent.normalize();
+        }
+      });
+    }
+    highlight(sentence) {
+      this.clear();
+      if (typeof document === "undefined") return false;
+      const needle = normalizeForMatch(sentence || "");
+      if (!needle) return false;
+      const root = this.container || document.body || document.documentElement;
+      if (!root) return false;
+      this.ensureStyleInjected();
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      const chars = [];
+      const charMap = [];
+      let currentNode = walker.nextNode();
+      while (currentNode) {
+        const textNode = currentNode;
+        const parentEl = textNode.parentElement;
+        if (!parentEl || !parentEl.closest(SKIP_ANCESTOR_SELECTOR)) {
+          const val = textNode.nodeValue || "";
+          for (let i = 0; i < val.length; i++) {
+            const ch = val[i];
+            if (!isSkippableChar(ch)) {
+              chars.push(ch);
+              charMap.push({ node: textNode, offset: i });
+            }
+          }
+        }
+        currentNode = walker.nextNode();
+      }
+      if (chars.length === 0) return false;
+      const haystack = chars.join("");
+      const searchStart = Math.max(0, this.lastMatchPos);
+      let matchIdx = haystack.indexOf(needle, searchStart);
+      let matchLen = needle.length;
+      if (matchIdx === -1) {
+        matchIdx = haystack.indexOf(needle);
+      }
+      if (matchIdx === -1 && needle.length > 16) {
+        const anchor = needle.slice(0, 16);
+        matchIdx = haystack.indexOf(anchor, searchStart);
+        if (matchIdx === -1) {
+          matchIdx = haystack.indexOf(anchor);
+        }
+        if (matchIdx !== -1) {
+          matchLen = anchor.length;
+        }
+      }
+      if (matchIdx === -1) {
+        return false;
+      }
+      const endPos = matchIdx + matchLen;
+      this.lastMatchPos = endPos;
+      const rangesByNode = /* @__PURE__ */ new Map();
+      for (let i = matchIdx; i < endPos; i++) {
+        const mapping = charMap[i];
+        const existing = rangesByNode.get(mapping.node);
+        if (!existing) {
+          rangesByNode.set(mapping.node, { start: mapping.offset, end: mapping.offset + 1 });
+        } else {
+          existing.end = Math.max(existing.end, mapping.offset + 1);
+        }
+      }
+      const entries = Array.from(rangesByNode.entries());
+      const wrappedMarks = [];
+      for (let i = entries.length - 1; i >= 0; i--) {
+        const [textNode, range] = entries[i];
+        if (!textNode.parentNode) continue;
+        let targetNode = textNode;
+        if (range.start > 0) {
+          targetNode = textNode.splitText(range.start);
+        }
+        const spanLen = range.end - range.start;
+        if (spanLen < targetNode.data.length) {
+          targetNode.splitText(spanLen);
+        }
+        const mark = document.createElement("mark");
+        mark.className = HIGHLIGHT_CLASS;
+        targetNode.parentNode.insertBefore(mark, targetNode);
+        mark.appendChild(targetNode);
+        wrappedMarks.push(mark);
+      }
+      this.activeMarks = wrappedMarks.reverse();
+      if (this.activeMarks.length > 0 && Date.now() - this.lastUserScrollAt > USER_SCROLL_PROTECT_MS) {
+        this.scrollIntoViewSafe(this.activeMarks[0]);
+      }
+      return this.activeMarks.length > 0;
+    }
+    scrollIntoViewSafe(el) {
+      try {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+      } catch {
+        try {
+          el.scrollIntoView();
+        } catch {
+        }
+      }
+    }
+    destroy() {
+      this.clear();
+      if (typeof window !== "undefined") {
+        window.removeEventListener("touchstart", this.onTouchStart);
+        window.removeEventListener("wheel", this.onWheel);
+      }
+      if (typeof document !== "undefined") {
+        const styleEl = document.getElementById(HIGHLIGHT_STYLE_ID);
+        if (styleEl && styleEl.parentNode) {
+          styleEl.parentNode.removeChild(styleEl);
+        }
+      }
+    }
+  }
+  function countEffectiveChars(paragraphs) {
+    return paragraphs.reduce((sum, p) => sum + p.replace(/\s+/g, "").length, 0);
+  }
   function initNovelTTS() {
     if (typeof window !== "undefined" && window.self !== window.top) {
       return;
@@ -4361,11 +6029,21 @@
       workerUrl: config.workerUrl || "",
       token: config.token || "dev-secret"
     });
-    const chapterLoader = new ChapterLoader(window.location.href);
+    const initialPageUrl = window.location.href;
+    const chapterLoader = new ChapterLoader(initialPageUrl);
+    const pageHighlighter = new PageHighlighter();
     let currentChapter = null;
-    let nextChapterUrl = null;
-    let lastSeenHref = window.location.href;
+    let currentChunks = [];
+    let currentChapterUrl = initialPageUrl;
+    let activeChunkIndex = -1;
+    let lastSeenHref = initialPageUrl;
     let isChapterLoading = false;
+    let bar;
+    let readerView;
+    const isPlayerActive = () => {
+      const state = player.getState();
+      return state === "playing" || state === "loading" || state === "paused";
+    };
     const player = new NovelPlayer({
       provider: workerProvider,
       voice: config.voice,
@@ -4373,77 +6051,216 @@
       events: {
         onStateChange: (state) => {
           bar.updatePlayerState(state);
+          readerView.updatePlayerState(state);
+          if (state === "idle" && !isChapterLoading) {
+            activeChunkIndex = -1;
+            pageHighlighter.clear();
+            readerView.setActiveChunk(-1);
+          }
         },
         onIndexChange: (idx, total, text) => {
+          activeChunkIndex = idx;
           bar.updateProgress(idx, total, text);
+          readerView.updateProgress(idx, total);
+          readerView.setActiveChunk(idx);
+          if (!readerView.isOpen() && currentChapterUrl === initialPageUrl) {
+            pageHighlighter.highlight(text);
+          }
         },
         onToast: (msg) => {
           bar.showToast(msg);
         },
         onChapterEnd: () => {
-          void handleAutoNextChapter(false);
+          void handleLoadChapter("next", { isManual: false, autoPlay: true });
         }
       }
     });
-    const ensureCurrentChapterParsed = () => {
+    const ensureCurrentChapterParsed = (silent = false) => {
       const href = window.location.href;
       if (!currentChapter || currentChapter.paragraphs.length === 0 || lastSeenHref !== href) {
-        bar.showToast("正在解析小说正文…");
+        if (!silent) {
+          bar.showToast("正在解析小说正文…");
+        }
         const extracted = extractChapterContent(document, href);
         lastSeenHref = href;
         if (!extracted || extracted.paragraphs.length === 0) {
           currentChapter = null;
-          nextChapterUrl = (extracted == null ? void 0 : extracted.nextChapterUrl) ?? null;
+          currentChunks = [];
           return null;
         }
         currentChapter = extracted;
-        nextChapterUrl = extracted.nextChapterUrl;
+        currentChapterUrl = href;
+        currentChunks = chunkParagraphs(extracted.paragraphs);
         chapterLoader.markVisited(href);
+        pageHighlighter.setContainer(findContentElement(document));
         bar.updateChapter(extracted.title);
       }
       return currentChapter;
     };
-    const handleAutoNextChapter = async (isManual = false) => {
-      if (isManual) {
+    const openReader = () => {
+      const chapter = ensureCurrentChapterParsed(true);
+      if (!chapter || currentChunks.length === 0) {
+        bar.showToast("未识别到小说正文，无法开启阅读模式");
+        return;
+      }
+      pageHighlighter.clear();
+      const isCrossChapter = currentChapterUrl !== initialPageUrl;
+      readerView.renderChapter(
+        chapter,
+        currentChunks,
+        isCrossChapter ? currentChapterUrl : void 0
+      );
+      readerView.updatePlayerState(player.getState());
+      readerView.updateProgress(
+        activeChunkIndex >= 0 ? activeChunkIndex : -1,
+        currentChunks.length
+      );
+      const latestCfg = ConfigStorage.load();
+      readerView.syncRate(latestCfg.rate);
+      readerView.syncVoice(latestCfg.voice);
+      readerView.syncConfigInputs(latestCfg.workerUrl, latestCfg.token);
+      readerView.applySettings(latestCfg.reader);
+      bar.setSuppressed(true);
+      readerView.open();
+      if (activeChunkIndex >= 0 && isPlayerActive()) {
+        readerView.setActiveChunk(activeChunkIndex);
+      }
+    };
+    const closeReader = () => {
+      readerView.close();
+      bar.setSuppressed(false);
+      if (isPlayerActive() && activeChunkIndex >= 0 && currentChapterUrl === initialPageUrl) {
+        const sentence = player.getSentences()[activeChunkIndex];
+        if (sentence) {
+          pageHighlighter.highlight(sentence);
+        }
+      }
+    };
+    const handlePlayToggle = async () => {
+      if (isChapterLoading) {
+        bar.showToast("正在加载章节，请稍候…");
+        return;
+      }
+      const state = player.getState();
+      if (state === "playing" || state === "loading") {
+        player.pause();
+        return;
+      }
+      if (state === "paused") {
+        if (!player.isFallbackMode()) {
+          player.unlockAllAudio({ audio: true, speech: false });
+        }
+        player.resume();
+        return;
+      }
+      const currentCfg = ConfigStorage.load();
+      const hasWorker = Boolean(currentCfg.workerUrl.trim());
+      if (hasWorker) {
+        player.unlockAllAudio({ audio: true, speech: true });
+      } else {
+        player.switchToFallback("未配置 Worker，已自动使用系统语音朗读（可点齿轮配置）");
+      }
+      try {
+        const chapter = ensureCurrentChapterParsed(readerView.isOpen());
+        if (!chapter) {
+          bar.showToast("未识别到小说正文，无法播放");
+          return;
+        }
+        if (!readerView.isOpen() && currentChapterUrl === initialPageUrl) {
+          pageHighlighter.setContainer(findContentElement(document));
+        }
+        await player.playChapter(chapter);
+      } catch (err) {
+        console.error("[NovelTTS] Play error:", err);
+        bar.showToast(`播放失败: ${(err == null ? void 0 : err.message) || err}`);
+      }
+    };
+    const handleSeekSentence = (chunkIndex) => {
+      if (isChapterLoading) {
+        bar.showToast("正在加载章节，请稍候…");
+        return;
+      }
+      const currentCfg = ConfigStorage.load();
+      const hasWorker = Boolean(currentCfg.workerUrl.trim());
+      if (hasWorker) {
+        player.unlockAllAudio({ audio: true, speech: true });
+      } else if (!player.isFallbackMode()) {
+        player.switchToFallback("未配置 Worker，已自动使用系统语音朗读");
+      }
+      const chapter = ensureCurrentChapterParsed(true);
+      if (!chapter || currentChunks.length === 0) {
+        bar.showToast("未识别到小说正文，无法播放");
+        return;
+      }
+      const safeIndex = Math.max(0, Math.min(chunkIndex, currentChunks.length - 1));
+      bar.showToast(`从第 ${safeIndex + 1} 句开始朗读`);
+      if (player.getState() === "idle" || player.getSentences().length === 0) {
+        void player.playChapter(chapter, safeIndex);
+      } else {
+        player.seek(safeIndex);
+      }
+    };
+    const handleLoadChapter = async (direction, options) => {
+      if (options.isManual && options.autoPlay) {
         player.unlockAllAudio({ audio: true, speech: true });
       }
       if (isChapterLoading) return;
-      if (!nextChapterUrl) {
-        nextChapterUrl = extractNextChapterUrl(document, window.location.href);
+      let targetUrl = null;
+      if (direction === "next") {
+        targetUrl = (currentChapter == null ? void 0 : currentChapter.nextChapterUrl) || extractNextChapterUrl(document, window.location.href);
+      } else {
+        targetUrl = (currentChapter == null ? void 0 : currentChapter.prevChapterUrl) || extractPrevChapterUrl(document, window.location.href);
       }
-      if (!nextChapterUrl) {
-        bar.showToast("已播放至最后一章");
+      if (!targetUrl) {
+        bar.showToast(direction === "prev" ? "已是第一章" : "已播放至最后一章");
         return;
       }
       if (player.getState() !== "idle") {
         player.stop();
       }
       isChapterLoading = true;
-      bar.showToast("正在加载下一章…");
-      const targetUrl = nextChapterUrl;
+      readerView.setChapterLoading(true);
+      bar.showToast(direction === "prev" ? "正在加载上一章…" : "正在加载下一章…");
       try {
-        const loaded = await chapterLoader.loadChapter(targetUrl);
+        const loaded = await chapterLoader.loadChapter(targetUrl, {
+          allowVisited: options.isManual
+        });
         if (!loaded || loaded.paragraphs.length === 0) {
-          throw new Error("下一章正文提取失败或已到达全书末尾");
+          throw new Error("章节正文提取失败或已到达边界");
         }
         currentChapter = loaded;
-        nextChapterUrl = loaded.nextChapterUrl;
-        bar.updateChapter(loaded.title, targetUrl);
-        bar.showToast(`已开始播放：${loaded.title}`);
+        currentChapterUrl = targetUrl;
+        currentChunks = chunkParagraphs(loaded.paragraphs);
+        activeChunkIndex = -1;
+        pageHighlighter.resetPosition();
+        const isCrossChapter = targetUrl !== initialPageUrl;
+        bar.updateChapter(loaded.title, isCrossChapter ? targetUrl : void 0);
+        readerView.renderChapter(
+          loaded,
+          currentChunks,
+          isCrossChapter ? targetUrl : void 0
+        );
         try {
           window.history.replaceState(null, "", targetUrl);
           document.title = loaded.title;
         } catch {
         }
         lastSeenHref = window.location.href;
-        if (!ConfigStorage.load().workerUrl.trim()) {
-          player.switchToFallback();
+        if (options.autoPlay) {
+          bar.showToast(`已开始播放：${loaded.title}`);
+          if (!ConfigStorage.load().workerUrl.trim()) {
+            player.switchToFallback();
+          }
+          await player.playChapter(loaded);
+        } else {
+          bar.updateProgress(-1, currentChunks.length);
+          readerView.updateProgress(-1, currentChunks.length);
+          bar.showToast(`已加载：${loaded.title}`);
         }
-        await player.playChapter(loaded);
       } catch (err) {
-        console.warn("[NovelTTS] Failed to load next chapter silently:", err);
-        if (isManual) {
-          bar.showToast("静默加载受限，正在直接跳转下一章…");
+        console.warn("[NovelTTS] Failed to load chapter silently:", err);
+        if (options.isManual) {
+          bar.showToast("静默加载受限，正在直接跳转章节…");
           setTimeout(() => {
             window.location.href = targetUrl;
           }, 300);
@@ -4452,80 +6269,54 @@
         }
       } finally {
         isChapterLoading = false;
+        readerView.setChapterLoading(false);
       }
     };
-    const bar = new FloatingBar(config, {
-      onPlayToggle: async () => {
-        if (isChapterLoading) {
-          bar.showToast("正在加载下一章，请稍候…");
-          return;
-        }
-        const state = player.getState();
-        if (state === "playing" || state === "loading") {
-          player.pause();
-          return;
-        }
-        if (state === "paused") {
-          if (!player.isFallbackMode()) {
-            player.unlockAllAudio({ audio: true, speech: false });
-          }
-          player.resume();
-          return;
-        }
-        const currentCfg = ConfigStorage.load();
-        const hasWorker = Boolean(currentCfg.workerUrl.trim());
-        if (hasWorker) {
-          player.unlockAllAudio({ audio: true, speech: true });
-        } else {
-          player.switchToFallback("未配置 Worker，已自动使用系统语音朗读（可点齿轮配置）");
-        }
-        try {
-          const chapter = ensureCurrentChapterParsed();
-          if (!chapter) {
-            bar.showToast("未识别到小说正文，无法播放");
-            return;
-          }
-          await player.playChapter(chapter);
-        } catch (err) {
-          console.error("[NovelTTS] Play error:", err);
-          bar.showToast(`播放失败: ${(err == null ? void 0 : err.message) || err}`);
-        }
+    const handleRateChange = (rate) => {
+      player.setRate(rate);
+      ConfigStorage.save({ rate });
+      bar.syncRate(rate);
+      readerView.syncRate(rate);
+    };
+    const handleVoiceChange = (voice) => {
+      player.setVoice(voice);
+      ConfigStorage.save({ voice });
+      bar.syncVoice(voice);
+      readerView.syncVoice(voice);
+    };
+    const handleSaveConfig = (workerUrl, token) => {
+      const trimmedUrl = workerUrl.trim();
+      const effectiveToken = token.trim() || "dev-secret";
+      ConfigStorage.save({ workerUrl: trimmedUrl, token: effectiveToken });
+      bar.syncConfigInputs(trimmedUrl, effectiveToken);
+      readerView.syncConfigInputs(trimmedUrl, effectiveToken);
+      if (trimmedUrl) {
+        workerProvider.updateConfig(trimmedUrl, effectiveToken);
+        player.setProvider(workerProvider);
+        bar.showToast("配置已保存并生效");
+      } else {
+        workerProvider.updateConfig("", effectiveToken);
+        player.switchToFallback("已清空 Worker 地址，将使用系统语音朗读");
+      }
+    };
+    const handleTestConfig = async (workerUrl, token) => {
+      const effectiveToken = token.trim() || "dev-secret";
+      return await workerProvider.testConnection(workerUrl, effectiveToken);
+    };
+    bar = new FloatingBar(config, {
+      onPlayToggle: () => {
+        void handlePlayToggle();
       },
-      onNextSentence: () => {
-        player.nextSentence();
-      },
-      onPrevSentence: () => {
-        player.previousSentence();
-      },
+      onNextSentence: () => player.nextSentence(),
+      onPrevSentence: () => player.previousSentence(),
       onNextChapter: () => {
-        void handleAutoNextChapter(true);
+        void handleLoadChapter("next", { isManual: true, autoPlay: true });
       },
-      onRateChange: (rate) => {
-        player.setRate(rate);
-        ConfigStorage.save({ rate });
-      },
-      onVoiceChange: (voice) => {
-        player.setVoice(voice);
-        ConfigStorage.save({ voice });
-      },
-      onSaveConfig: (workerUrl, token) => {
-        const trimmedUrl = workerUrl.trim();
-        const effectiveToken = token.trim() || "dev-secret";
-        ConfigStorage.save({ workerUrl: trimmedUrl, token: effectiveToken });
-        bar.syncConfigInputs(trimmedUrl, effectiveToken);
-        if (trimmedUrl) {
-          workerProvider.updateConfig(trimmedUrl, effectiveToken);
-          player.setProvider(workerProvider);
-          bar.showToast("配置已保存并生效");
-        } else {
-          workerProvider.updateConfig("", effectiveToken);
-          player.switchToFallback("已清空 Worker 地址，将使用系统语音朗读");
-        }
-      },
-      onTestConfig: async (workerUrl, token) => {
-        const effectiveToken = token.trim() || "dev-secret";
-        return await workerProvider.testConnection(workerUrl, effectiveToken);
-      },
+      onOpenReader: openReader,
+      onRateChange: handleRateChange,
+      onVoiceChange: handleVoiceChange,
+      onSaveConfig: handleSaveConfig,
+      onTestConfig: handleTestConfig,
       onJumpChapterUrl: (url) => {
         window.location.href = url;
       },
@@ -4533,18 +6324,68 @@
         ConfigStorage.save({ ballPosition: pos });
       }
     });
-    const mountUI = () => {
-      bar.mount(document.documentElement || document.body);
+    readerView = new ReaderView(config, {
+      onClose: closeReader,
+      onPlayToggle: () => {
+        void handlePlayToggle();
+      },
+      onStop: () => player.stop(),
+      onPrevSentence: () => player.previousSentence(),
+      onNextSentence: () => player.nextSentence(),
+      onSeekSentence: handleSeekSentence,
+      onPrevChapter: () => {
+        void handleLoadChapter("prev", { isManual: true, autoPlay: isPlayerActive() });
+      },
+      onNextChapter: () => {
+        void handleLoadChapter("next", { isManual: true, autoPlay: isPlayerActive() });
+      },
+      onRateChange: handleRateChange,
+      onVoiceChange: handleVoiceChange,
+      onSaveConfig: handleSaveConfig,
+      onTestConfig: handleTestConfig,
+      onJumpChapterUrl: (url) => {
+        window.location.href = url;
+      },
+      onSettingsChange: (patch) => {
+        ConfigStorage.saveReaderSettings(patch);
+      },
+      onToast: (msg) => bar.showToast(msg)
+    });
+    const tryAutoEnterReader = () => {
+      if (!ConfigStorage.load().reader.autoEnter || readerView.isOpen()) {
+        return;
+      }
+      const chapter = ensureCurrentChapterParsed(true);
+      if (chapter && chapter.paragraphs.length >= 2 && countEffectiveChars(chapter.paragraphs) >= 200) {
+        openReader();
+      }
     };
-    if (document.documentElement || document.body) {
-      mountUI();
+    const mountUI = () => {
+      const parent = document.documentElement || document.body;
+      bar.mount(parent);
+      readerView.mount(parent);
+      tryAutoEnterReader();
+    };
+    if (document.readyState === "loading") {
+      bar.mount(document.documentElement || document.body);
+      window.addEventListener("DOMContentLoaded", mountUI, { once: true });
     } else {
-      window.addEventListener("DOMContentLoaded", mountUI);
+      mountUI();
     }
     if (typeof GM_registerMenuCommand === "function") {
       try {
         GM_registerMenuCommand("显示/隐藏听书悬浮球", () => {
+          if (readerView.isOpen()) {
+            closeReader();
+          }
           bar.toggleVisible();
+        });
+        GM_registerMenuCommand("开启/关闭阅读模式", () => {
+          if (readerView.isOpen()) {
+            closeReader();
+          } else {
+            openReader();
+          }
         });
       } catch {
       }

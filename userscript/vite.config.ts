@@ -8,7 +8,7 @@ export default defineConfig({
       userscript: {
         name: 'NovelTTS-Userscript',
         namespace: 'https://github.com/John-S-hall/ForIris',
-        version: '0.2.1',
+        version: '0.3.0',
         author: 'John-S-hall',
         description: '移动端网页小说听书油猴脚本',
         match: ['*://*/*'],

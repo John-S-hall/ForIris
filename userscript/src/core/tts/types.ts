@@ -2,6 +2,7 @@ export interface ChapterContent {
   title: string;
   paragraphs: string[];
   nextChapterUrl: string | null;
+  prevChapterUrl?: string | null;
 }
 
 export interface TTSOptions {

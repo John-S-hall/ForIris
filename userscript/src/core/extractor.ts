@@ -17,7 +17,7 @@ const NOVEL_CONTENT_SELECTORS = [
 ];
 
 /** 下一章链接干扰词过滤 */
-const NEXT_CHAPTER_EXCLUDE_REGEX = /(?:上一|目录|书架|书签|推荐|预告|催更|评论|投票)/;
+const NEXT_CHAPTER_EXCLUDE_REGEX = /(?:上一|上章|上页|目录|书架|书签|推荐|预告|催更|评论|投票)/;
 
 /** Tier 1 精确下一章文字 */
 const NEXT_CHAPTER_TIER1_REGEX = /^(?:下一[章节回话]|下章|后一章|nextchapter)[→>»›]*$/i;
@@ -27,6 +27,46 @@ const NEXT_CHAPTER_TIER2_REGEX = /^(?:下一页|下页|nextpage|next)[→>»›]
 
 /** Tier 3 模糊包含 */
 const NEXT_CHAPTER_TIER3_REGEX = /(?:下一章|下一页|下页|下一节|下章)/;
+
+/** 上一章链接干扰词过滤 */
+const PREV_CHAPTER_EXCLUDE_REGEX = /(?:下一|下章|下页|目录|书架|书签|推荐|预告|催更|评论|投票)/;
+
+/** Tier 1 精确上一章文字 */
+const PREV_CHAPTER_TIER1_REGEX =
+  /^(?:上一[章节回话]|上章|前一章|prevchapter|previouschapter)[←<«‹]*$/i;
+
+/** Tier 2 上一页文字 */
+const PREV_CHAPTER_TIER2_REGEX = /^(?:上一页|上页|prevpage|prev|previous)[←<«‹]*$/i;
+
+/** Tier 3 模糊包含 */
+const PREV_CHAPTER_TIER3_REGEX = /(?:上一章|上一页|上页|上一节|上章)/;
+
+interface ChapterNavRule {
+  rel: 'next' | 'prev';
+  knownSelector: string;
+  excludeRegex: RegExp;
+  tier1Regex: RegExp;
+  tier2Regex: RegExp;
+  tier3Regex: RegExp;
+}
+
+const NEXT_CHAPTER_RULE: ChapterNavRule = {
+  rel: 'next',
+  knownSelector: '#pb_next, #next_url, #pt_next, #nextchapter, #linkNext, a.next-chapter',
+  excludeRegex: NEXT_CHAPTER_EXCLUDE_REGEX,
+  tier1Regex: NEXT_CHAPTER_TIER1_REGEX,
+  tier2Regex: NEXT_CHAPTER_TIER2_REGEX,
+  tier3Regex: NEXT_CHAPTER_TIER3_REGEX,
+};
+
+const PREV_CHAPTER_RULE: ChapterNavRule = {
+  rel: 'prev',
+  knownSelector: '#pb_prev, #prev_url, #pt_prev, #prevchapter, #linkPrev, a.prev-chapter',
+  excludeRegex: PREV_CHAPTER_EXCLUDE_REGEX,
+  tier1Regex: PREV_CHAPTER_TIER1_REGEX,
+  tier2Regex: PREV_CHAPTER_TIER2_REGEX,
+  tier3Regex: PREV_CHAPTER_TIER3_REGEX,
+};
 
 /** 非法/非导航链接协议 */
 const INVALID_HREF_PROTOCOL_REGEX = /^(?:javascript|mailto|tel):/i;
@@ -212,6 +252,23 @@ function findFallbackContentElement(doc: Document): Element | null {
 }
 
 /**
+ * 查找当前文档最可能承载小说正文的 DOM 容器（供原网页高亮器使用）
+ */
+export function findContentElement(doc: Document): Element | null {
+  const matched = findFallbackContentElement(doc);
+  if (matched) return matched;
+
+  const semantic = doc.querySelector('article, main');
+  if (semantic) {
+    const stats = measureTextStats(semantic);
+    if (stats.nonLinkChars >= MIN_CONTENT_CHAR_THRESHOLD) {
+      return semantic;
+    }
+  }
+  return null;
+}
+
+/**
  * 启发式提取标题
  */
 function extractFallbackTitle(doc: Document): string {
@@ -264,10 +321,11 @@ function resolveValidNextUrl(
   }
 }
 
-/**
- * 提取下一章完整绝对 URL（分级打分 + 评论区隔离 + 空格归一化）
- */
-export function extractNextChapterUrl(doc: Document, currentUrl?: string): string | null {
+function extractChapterNavUrl(
+  doc: Document,
+  currentUrl: string | undefined,
+  rule: ChapterNavRule
+): string | null {
   const pageUrl = currentUrl || doc.baseURI || 'http://localhost';
   let currentParsed: URL | null = null;
   try {
@@ -305,25 +363,21 @@ export function extractNextChapterUrl(doc: Document, currentUrl?: string): strin
     const compactText = cleanLine(link.textContent || '').replace(/\s+/g, '');
     const compactTitle = cleanLine(link.getAttribute('title') || '').replace(/\s+/g, '');
 
-    if (
-      NEXT_CHAPTER_EXCLUDE_REGEX.test(compactText) ||
-      NEXT_CHAPTER_EXCLUDE_REGEX.test(compactTitle)
-    ) {
+    if (rule.excludeRegex.test(compactText) || rule.excludeRegex.test(compactTitle)) {
       continue;
     }
 
-    const isKnownNextSelector =
-      link.getAttribute('rel')?.toLowerCase() === 'next' ||
-      link.matches('#pb_next, #next_url, #pt_next, #nextchapter, #linkNext, a.next-chapter');
+    const isKnownSelector =
+      link.getAttribute('rel')?.toLowerCase() === rule.rel || link.matches(rule.knownSelector);
 
     let score = 0;
-    if (NEXT_CHAPTER_TIER1_REGEX.test(compactText) || isKnownNextSelector) {
+    if (rule.tier1Regex.test(compactText) || isKnownSelector) {
       score = 100;
-    } else if (NEXT_CHAPTER_TIER2_REGEX.test(compactText)) {
+    } else if (rule.tier2Regex.test(compactText)) {
       score = 70;
     } else if (
-      (NEXT_CHAPTER_TIER3_REGEX.test(compactText) && compactText.length <= 16) ||
-      (NEXT_CHAPTER_TIER3_REGEX.test(compactTitle) && compactTitle.length <= 16)
+      (rule.tier3Regex.test(compactText) && compactText.length <= 16) ||
+      (rule.tier3Regex.test(compactTitle) && compactTitle.length <= 16)
     ) {
       score = 40;
     }
@@ -344,12 +398,27 @@ export function extractNextChapterUrl(doc: Document, currentUrl?: string): strin
 }
 
 /**
+ * 提取下一章完整绝对 URL（分级打分 + 评论区隔离 + 空格归一化）
+ */
+export function extractNextChapterUrl(doc: Document, currentUrl?: string): string | null {
+  return extractChapterNavUrl(doc, currentUrl, NEXT_CHAPTER_RULE);
+}
+
+/**
+ * 提取上一章完整绝对 URL（与下一章提取对称的分级打分机制）
+ */
+export function extractPrevChapterUrl(doc: Document, currentUrl?: string): string | null {
+  return extractChapterNavUrl(doc, currentUrl, PREV_CHAPTER_RULE);
+}
+
+/**
  * 正文提取入口函数
  * @param doc DOM Document 对象
  * @param currentUrl 当前页面 URL（用于将相对路径解析为完整绝对 URL 并检测自环）
  */
 export function extractChapterContent(doc: Document, currentUrl?: string): ChapterContent {
   const nextChapterUrl = extractNextChapterUrl(doc, currentUrl);
+  const prevChapterUrl = extractPrevChapterUrl(doc, currentUrl);
 
   let title = '';
   let paragraphs: string[] = [];
@@ -409,5 +478,6 @@ export function extractChapterContent(doc: Document, currentUrl?: string): Chapt
     title,
     paragraphs,
     nextChapterUrl,
+    prevChapterUrl,
   };
 }

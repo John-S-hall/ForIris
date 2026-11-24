@@ -204,6 +204,27 @@ describe('chapterLoader.ts - 静默下一章加载与编码探测', () => {
       expect(result).toBeNull();
     });
 
+    it('允许传 allowVisited: true 重读已访问章节（用于手动上一章回看）', async () => {
+      const buffer = new TextEncoder().encode(chapterHtml).buffer;
+      const currentOrigin = window.location.origin;
+      const visitedUrl = `${currentOrigin}/book/101/chapter_1.html`;
+
+      window.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        headers: new Headers({ 'content-type': 'text/html; charset=utf-8' }),
+        arrayBuffer: async () => buffer,
+      } as any);
+
+      const loader = new ChapterLoader(`${currentOrigin}/book/101/chapter_2.html`);
+      loader.markVisited(visitedUrl);
+
+      expect(await loader.loadChapter(visitedUrl)).toBeNull();
+      const revisited = await loader.loadChapter(visitedUrl, { allowVisited: true });
+      expect(revisited).not.toBeNull();
+      expect(revisited?.paragraphs.length).toBeGreaterThanOrEqual(3);
+    });
+
     it('非法 URL 请求直接返回 null', async () => {
       const loader = new ChapterLoader();
       const result = await loader.loadChapter('javascript:void(0)');

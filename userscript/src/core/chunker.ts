@@ -5,6 +5,17 @@ export interface ChunkerOptions {
   maxChars?: number;
 }
 
+export interface ChunkSegment {
+  paragraphIndex: number;
+  text: string;
+}
+
+export interface StructuredChunk {
+  index: number;
+  text: string;
+  segments: ChunkSegment[];
+}
+
 const DEFAULT_MIN_CHARS = 30;
 const DEFAULT_MAX_CHARS = 120;
 
@@ -80,26 +91,13 @@ function splitOverlongSentence(sentence: string, maxChars: number): string[] {
 }
 
 /**
- * 核心分句函数：
- * 1. 按主要标点 (。！？；\n) 初步切分，保留标点及随后的闭合引号
- * 2. 超过 maxChars (120) 的长句按逗号或字数硬切分
- * 3. 贪心合并小于 minChars (30) 的相邻碎句（控制在 maxChars 内）
- * 4. 过滤纯空白与纯标点片段
+ * 将文本切分为不超过 maxChars 的原子短句（保留原有切分与标点过滤逻辑）
  */
-export function chunkText(
-  input: string | string[],
-  options?: ChunkerOptions
-): string[] {
-  const minChars = options?.minChars ?? DEFAULT_MIN_CHARS;
-  const maxChars = options?.maxChars ?? DEFAULT_MAX_CHARS;
-
-  // 归一化输入为单一文本字符串
-  const rawText = Array.isArray(input) ? input.join('\n') : input;
+function splitTextToAtomicSentences(rawText: string, maxChars: number): string[] {
   if (!rawText || !rawText.trim()) {
     return [];
   }
 
-  // 1. 第一阶段：主标点切分
   const rawSegments = rawText.match(PRIMARY_DELIMITER_REGEX) || [rawText];
   const atomicSentences: string[] = [];
 
@@ -122,41 +120,107 @@ export function chunkText(
     }
   }
 
-  if (atomicSentences.length === 0) {
+  return atomicSentences;
+}
+
+function appendSegment(target: ChunkSegment[], seg: ChunkSegment): void {
+  const last = target[target.length - 1];
+  if (last && last.paragraphIndex === seg.paragraphIndex) {
+    last.text += seg.text;
+  } else {
+    target.push({ paragraphIndex: seg.paragraphIndex, text: seg.text });
+  }
+}
+
+/**
+ * 结构化分句函数（保留每个片段对应的原段落索引，用于阅读模式精准句级渲染与高亮）
+ */
+export function chunkParagraphs(
+  paragraphs: string[],
+  options?: ChunkerOptions
+): StructuredChunk[] {
+  const minChars = options?.minChars ?? DEFAULT_MIN_CHARS;
+  const maxChars = options?.maxChars ?? DEFAULT_MAX_CHARS;
+
+  if (!Array.isArray(paragraphs) || paragraphs.length === 0) {
     return [];
   }
 
-  // 2. 第二阶段：合并过短碎句（贪心合并至 minChars ~ maxChars 之间）
-  const mergedChunks: string[] = [];
-  let buffer = '';
+  const atomicSegments: ChunkSegment[] = [];
+  for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex++) {
+    const pieces = splitTextToAtomicSentences(paragraphs[paragraphIndex], maxChars);
+    for (const piece of pieces) {
+      atomicSegments.push({ paragraphIndex, text: piece });
+    }
+  }
 
-  for (const sentence of atomicSentences) {
-    if (!buffer) {
-      buffer = sentence;
+  if (atomicSegments.length === 0) {
+    return [];
+  }
+
+  const merged: StructuredChunk[] = [];
+  let bufferText = '';
+  let bufferSegments: ChunkSegment[] = [];
+
+  for (const seg of atomicSegments) {
+    if (!bufferText) {
+      bufferText = seg.text;
+      bufferSegments = [{ paragraphIndex: seg.paragraphIndex, text: seg.text }];
       continue;
     }
 
-    // 若当前 buffer 字数未达到 minChars，且合并后不超过 maxChars，则合并
-    if (buffer.length < minChars && buffer.length + sentence.length <= maxChars) {
-      buffer += sentence;
+    if (bufferText.length < minChars && bufferText.length + seg.text.length <= maxChars) {
+      bufferText += seg.text;
+      appendSegment(bufferSegments, seg);
     } else {
-      mergedChunks.push(buffer);
-      buffer = sentence;
+      merged.push({
+        index: merged.length,
+        text: bufferText,
+        segments: bufferSegments,
+      });
+      bufferText = seg.text;
+      bufferSegments = [{ paragraphIndex: seg.paragraphIndex, text: seg.text }];
     }
   }
 
-  if (buffer) {
-    // 检查末尾残留的 buffer 是否过短且可与前一句合并
+  if (bufferText) {
     if (
-      buffer.length < minChars &&
-      mergedChunks.length > 0 &&
-      mergedChunks[mergedChunks.length - 1].length + buffer.length <= maxChars
+      bufferText.length < minChars &&
+      merged.length > 0 &&
+      merged[merged.length - 1].text.length + bufferText.length <= maxChars
     ) {
-      mergedChunks[mergedChunks.length - 1] += buffer;
+      const prev = merged[merged.length - 1];
+      prev.text += bufferText;
+      for (const seg of bufferSegments) {
+        appendSegment(prev.segments, seg);
+      }
     } else {
-      mergedChunks.push(buffer);
+      merged.push({
+        index: merged.length,
+        text: bufferText,
+        segments: bufferSegments,
+      });
     }
   }
 
-  return mergedChunks.filter((chunk) => !isPunctuationOrWhitespaceOnly(chunk));
+  const filtered = merged.filter((chunk) => !isPunctuationOrWhitespaceOnly(chunk.text));
+  filtered.forEach((chunk, idx) => {
+    chunk.index = idx;
+  });
+  return filtered;
+}
+
+/**
+ * 核心分句函数：
+ * 1. 按主要标点 (。！？；\n) 初步切分，保留标点及随后的闭合引号
+ * 2. 超过 maxChars (120) 的长句按逗号或字数硬切分
+ * 3. 贪心合并小于 minChars (30) 的相邻碎句（控制在 maxChars 内）
+ * 4. 过滤纯空白与纯标点片段
+ */
+export function chunkText(
+  input: string | string[],
+  options?: ChunkerOptions
+): string[] {
+  const paragraphs = Array.isArray(input) ? input : [input];
+  return chunkParagraphs(paragraphs, options).map((chunk) => chunk.text);
 }

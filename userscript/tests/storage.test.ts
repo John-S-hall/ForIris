@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { ConfigStorage, DEFAULT_CONFIG } from '../src/core/storage';
+import {
+  ConfigStorage,
+  DEFAULT_CONFIG,
+  DEFAULT_READER_SETTINGS,
+} from '../src/core/storage';
 
 describe('storage.ts - 跨站配置持久化与降级存储', () => {
   beforeEach(() => {
@@ -73,5 +77,44 @@ describe('storage.ts - 跨站配置持久化与降级存储', () => {
 
     const loaded = ConfigStorage.load();
     expect(loaded.ballPosition).toEqual({ side: 'left', offsetTop: 240 });
+  });
+
+  it('支持阅读模式配置 (reader)：saveReaderSettings 部分合并、边界钳制及旧版无 reader 兼容', () => {
+    // 旧版无 reader 字段自动补全默认值
+    localStorage.setItem(
+      'novel_tts_config',
+      JSON.stringify({
+        workerUrl: 'https://worker.example.com',
+        token: 'secret',
+      })
+    );
+    const compat = ConfigStorage.load();
+    expect(compat.reader).toEqual(DEFAULT_READER_SETTINGS);
+
+    // 部分更新阅读模式偏好不影响其他字段
+    ConfigStorage.saveReaderSettings({ theme: 'dark', fontSize: 22 });
+    const updated = ConfigStorage.load();
+    expect(updated.reader).toEqual({
+      theme: 'dark',
+      fontSize: 22,
+      lineHeight: DEFAULT_READER_SETTINGS.lineHeight,
+      autoEnter: false,
+    });
+    expect(updated.workerUrl).toBe('https://worker.example.com');
+
+    // 越界数值与非法主题安全钳制
+    ConfigStorage.saveReaderSettings({
+      theme: 'invalid-theme' as any,
+      fontSize: 99,
+      lineHeight: 0.5,
+      autoEnter: true,
+    });
+    const clamped = ConfigStorage.load();
+    expect(clamped.reader).toEqual({
+      theme: DEFAULT_READER_SETTINGS.theme,
+      fontSize: 28,
+      lineHeight: 1.4,
+      autoEnter: true,
+    });
   });
 });
