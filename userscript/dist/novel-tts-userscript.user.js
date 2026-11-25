@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelTTS-Userscript
 // @namespace    https://github.com/John-S-hall/ForIris
-// @version      0.4.1
+// @version      0.4.2
 // @author       John-S-hall
 // @description  移动端网页小说听书油猴脚本
 // @match        *://*/*
@@ -3236,6 +3236,15 @@
     seek(index) {
       if (this.sentences.length === 0) return;
       this.clearRetryTimer();
+      this.playToken++;
+      if (this.isUsingFallback) {
+        this.webSpeechEngine.cancel();
+      } else if (this.audio && typeof this.audio.pause === "function") {
+        try {
+          this.audio.pause();
+        } catch {
+        }
+      }
       this.unlockAllAudio({ audio: !this.isUsingFallback, speech: false });
       const target = Math.max(0, Math.min(index, this.sentences.length - 1));
       this.clearPrefetchCache();
@@ -4895,13 +4904,24 @@
 
   .reader-root {
     position: fixed;
-    inset: 0;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    height: 100%;
+    min-height: 100dvh;
     display: flex;
     flex-direction: column;
     background: var(--bg);
     color: var(--text);
     --reader-font-size: 18px;
     --reader-line-height: 1.85;
+  }
+
+  input, select, textarea {
+    -webkit-user-select: text;
+    user-select: text;
   }
 
   /* 4 套夸克风格主题 */
@@ -4992,12 +5012,18 @@
     -webkit-overflow-scrolling: touch;
     overscroll-behavior: contain;
     touch-action: manipulation;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
   }
   .reader-article {
     max-width: 720px;
     margin: 0 auto;
     padding: calc(44px + env(safe-area-inset-top, 0px)) 20px calc(110px + env(safe-area-inset-bottom, 0px));
     box-sizing: border-box;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
   }
 
   .top-prev-wrap {
@@ -5607,8 +5633,19 @@
   const USER_SCROLL_PROTECT_MS$1 = 4e3;
   const MAX_RENDERED_CHAPTERS = 5;
   const INFINITE_SCROLL_PRELOAD_PX = 700;
+  const DOUBLE_TAP_WINDOW_MS = 340;
+  const SINGLE_TAP_DELAY_MS = 350;
+  const TAP_MOVE_THRESHOLD_PX = 15;
   const ISOLATION_STYLE_ID = "novel-tts-reader-host-isolation";
+  const INJECTED_THEME_META_ID = "novel-tts-theme-color";
+  const INJECTED_VIEWPORT_META_ID = "novel-tts-viewport";
   const READER_ACTIVE_CLASS = "novel-tts-reader-active";
+  const THEME_CHROME_MAP = {
+    light: { bg: "#f8fafc", scheme: "light" },
+    sepia: { bg: "#f4ecd8", scheme: "light" },
+    green: { bg: "#cce8cf", scheme: "light" },
+    dark: { bg: "#12151c", scheme: "dark" }
+  };
   const LINE_HEIGHT_PRESETS = [
     { value: 1.6, label: "紧凑" },
     { value: 1.85, label: "适中" },
@@ -5649,12 +5686,18 @@
       __publicField(this, "opened", false);
       __publicField(this, "isMenuOpen", false);
       __publicField(this, "activeSubpanel", "none");
-      // 原网页滚动与样式隔离状态备份
+      // 原网页滚动与顶底全屏沉浸状态备份
       __publicField(this, "hasSavedPageState", false);
+      __publicField(this, "isChromeSynced", false);
       __publicField(this, "savedHtmlOverflow", null);
       __publicField(this, "savedBodyOverflow", null);
       __publicField(this, "savedScrollX", 0);
       __publicField(this, "savedScrollY", 0);
+      __publicField(this, "savedThemeMetas", []);
+      __publicField(this, "injectedThemeMeta", null);
+      __publicField(this, "savedViewportMeta", null);
+      __publicField(this, "injectedViewportMeta", null);
+      __publicField(this, "onFullscreenChangeHandler", null);
       // 手动滑动保护与双击识别
       __publicField(this, "lastUserScrollAt", 0);
       __publicField(this, "programmaticScrollUntil", 0);
@@ -5681,6 +5724,7 @@
       __publicField(this, "topBarEl");
       __publicField(this, "topTitleEl");
       __publicField(this, "jumpBtn");
+      __publicField(this, "fullscreenBtn");
       __publicField(this, "bottomDockEl");
       __publicField(this, "panelAppearanceEl");
       __publicField(this, "panelTtsEl");
@@ -5727,7 +5771,12 @@
     }
     applyHostStyles() {
       this.host.style.setProperty("position", "fixed", "important");
-      this.host.style.setProperty("inset", "0", "important");
+      this.host.style.setProperty("top", "0", "important");
+      this.host.style.setProperty("left", "0", "important");
+      this.host.style.setProperty("right", "0", "important");
+      this.host.style.setProperty("bottom", "0", "important");
+      this.host.style.setProperty("width", "100%", "important");
+      this.host.style.setProperty("height", "100%", "important");
       this.host.style.setProperty("z-index", "2147483646", "important");
       this.host.style.setProperty("display", "none", "important");
       this.host.style.setProperty("margin", "0", "important");
@@ -5745,6 +5794,19 @@
       style.textContent = `
       html.${READER_ACTIVE_CLASS} {
         overflow: hidden !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border: 0 !important;
+        width: 100% !important;
+        max-width: none !important;
+        height: 100% !important;
+        min-height: 100% !important;
+        transform: none !important;
+        filter: none !important;
+        perspective: none !important;
+        zoom: 1 !important;
+        background: var(--novel-tts-reader-bg, #f4ecd8) !important;
+        color-scheme: var(--novel-tts-reader-scheme, light) !important;
       }
       html.${READER_ACTIVE_CLASS} > *:not(head):not(#novel-tts-reader-root):not(#novel-tts-floating-root) {
         display: none !important;
@@ -5753,6 +5815,94 @@
       }
     `;
       target.appendChild(style);
+    }
+    syncDocumentChrome(theme) {
+      if (typeof document === "undefined") return;
+      const chrome = THEME_CHROME_MAP[theme] || THEME_CHROME_MAP.sepia;
+      document.documentElement.style.setProperty("--novel-tts-reader-bg", chrome.bg);
+      document.documentElement.style.setProperty("--novel-tts-reader-scheme", chrome.scheme);
+      const headTarget = document.head || document.documentElement;
+      if (!this.isChromeSynced) {
+        this.isChromeSynced = true;
+        const existingThemes = Array.from(
+          document.querySelectorAll('meta[name="theme-color"]')
+        );
+        if (existingThemes.length > 0) {
+          this.savedThemeMetas = existingThemes.map((el) => ({
+            el,
+            prevContent: el.getAttribute("content")
+          }));
+        } else if (headTarget) {
+          const meta = document.createElement("meta");
+          meta.id = INJECTED_THEME_META_ID;
+          meta.name = "theme-color";
+          headTarget.appendChild(meta);
+          this.injectedThemeMeta = meta;
+        }
+        const existingViewport = document.querySelector('meta[name="viewport"]');
+        if (existingViewport) {
+          const prevContent = existingViewport.getAttribute("content");
+          this.savedViewportMeta = { el: existingViewport, prevContent };
+          if (!(prevContent || "").toLowerCase().includes("viewport-fit=cover")) {
+            existingViewport.setAttribute(
+              "content",
+              prevContent ? `${prevContent}, viewport-fit=cover` : "width=device-width, initial-scale=1.0, viewport-fit=cover"
+            );
+          }
+        } else if (headTarget) {
+          const meta = document.createElement("meta");
+          meta.id = INJECTED_VIEWPORT_META_ID;
+          meta.name = "viewport";
+          meta.setAttribute("content", "width=device-width, initial-scale=1.0, viewport-fit=cover");
+          headTarget.appendChild(meta);
+          this.injectedViewportMeta = meta;
+        }
+      }
+      for (const entry of this.savedThemeMetas) {
+        entry.el.setAttribute("content", chrome.bg);
+      }
+      if (this.injectedThemeMeta) {
+        this.injectedThemeMeta.setAttribute("content", chrome.bg);
+      }
+    }
+    restoreDocumentChrome() {
+      var _a, _b, _c;
+      if (typeof document === "undefined") return;
+      document.documentElement.style.removeProperty("--novel-tts-reader-bg");
+      document.documentElement.style.removeProperty("--novel-tts-reader-scheme");
+      for (const entry of this.savedThemeMetas) {
+        if (entry.prevContent === null) {
+          entry.el.removeAttribute("content");
+        } else {
+          entry.el.setAttribute("content", entry.prevContent);
+        }
+      }
+      this.savedThemeMetas = [];
+      if (this.injectedThemeMeta && this.injectedThemeMeta.parentNode) {
+        this.injectedThemeMeta.parentNode.removeChild(this.injectedThemeMeta);
+      }
+      this.injectedThemeMeta = null;
+      if (this.savedViewportMeta) {
+        const { el, prevContent } = this.savedViewportMeta;
+        if (prevContent === null) {
+          el.removeAttribute("content");
+        } else {
+          el.setAttribute("content", prevContent);
+        }
+        this.savedViewportMeta = null;
+      }
+      if (this.injectedViewportMeta && this.injectedViewportMeta.parentNode) {
+        this.injectedViewportMeta.parentNode.removeChild(this.injectedViewportMeta);
+      }
+      this.injectedViewportMeta = null;
+      this.isChromeSynced = false;
+      if (document.fullscreenElement === document.documentElement || document.fullscreenElement === this.host) {
+        try {
+          void ((_c = (_b = (_a = document.exitFullscreen) == null ? void 0 : _a.call(document)) == null ? void 0 : _b.catch) == null ? void 0 : _c.call(_b, () => {
+          }));
+        } catch {
+        }
+      }
     }
     mount(parent) {
       const target = parent || document.documentElement || document.body;
@@ -5763,6 +5913,10 @@
     unmount() {
       this.clearSingleTapTimer();
       this.restorePageOverflow();
+      if (typeof document !== "undefined" && this.onFullscreenChangeHandler) {
+        document.removeEventListener("fullscreenchange", this.onFullscreenChangeHandler);
+        this.onFullscreenChangeHandler = null;
+      }
       if (this.host.parentNode) {
         this.host.parentNode.removeChild(this.host);
       }
@@ -5787,6 +5941,7 @@
         if (this.host.parentNode === document.documentElement) {
           document.documentElement.classList.add(READER_ACTIVE_CLASS);
         }
+        this.syncDocumentChrome(this.settings.theme);
         this.hasSavedPageState = true;
       }
       this.host.style.setProperty("display", "block", "important");
@@ -5807,6 +5962,7 @@
     restorePageOverflow() {
       if (typeof document === "undefined") return;
       document.documentElement.classList.remove(READER_ACTIVE_CLASS);
+      this.restoreDocumentChrome();
       if (this.savedHtmlOverflow !== null) {
         document.documentElement.style.overflow = this.savedHtmlOverflow;
         this.savedHtmlOverflow = null;
@@ -6131,6 +6287,9 @@
         const val = Number.parseFloat(btn.dataset.lineHeight || "0");
         btn.classList.toggle("active", Math.abs(val - settings.lineHeight) < 0.05);
       });
+      if (this.opened) {
+        this.syncDocumentChrome(settings.theme);
+      }
       this.updateChapterControlsUI();
     }
     // ─── 目录抽屉管理 ──────────────────────────────────────────────────────
@@ -6348,6 +6507,7 @@
     }
     // ─── DOM 渲染 ──────────────────────────────────────────────────────────
     render(config) {
+      var _a;
       const style = document.createElement("style");
       style.textContent = READER_STYLES;
       const lineHeightButtonsHtml = LINE_HEIGHT_PRESETS.map(
@@ -6405,6 +6565,7 @@
         <button class="bar-text-btn" id="rv-exit">← 退出阅读</button>
         <span class="top-title" id="rv-top-title">阅读模式</span>
         <button class="bar-text-btn accent" id="rv-jump" style="display:none">查看原文</button>
+        <button class="bar-text-btn accent" id="rv-fullscreen" style="display:none" title="切换系统全屏">全屏</button>
         <button class="bar-text-btn" id="rv-top-worker" title="配置 Worker">⚙️</button>
       </div>
 
@@ -6531,6 +6692,11 @@
       this.topBarEl = this.shadow.querySelector("#rv-top-bar");
       this.topTitleEl = this.shadow.querySelector("#rv-top-title");
       this.jumpBtn = this.shadow.querySelector("#rv-jump");
+      this.fullscreenBtn = this.shadow.querySelector("#rv-fullscreen");
+      const supportsFullscreen = typeof document !== "undefined" && Boolean(document.fullscreenEnabled) && typeof ((_a = document.documentElement) == null ? void 0 : _a.requestFullscreen) === "function";
+      if (supportsFullscreen) {
+        this.fullscreenBtn.style.display = "inline-flex";
+      }
       this.bottomDockEl = this.shadow.querySelector("#rv-bottom-dock");
       this.panelAppearanceEl = this.shadow.querySelector("#rv-panel-appearance");
       this.panelTtsEl = this.shadow.querySelector("#rv-panel-tts");
@@ -6597,7 +6763,7 @@
         "touchmove",
         (e) => {
           if (e.touches.length === 1) {
-            if (Math.hypot(e.touches[0].clientX - downX, e.touches[0].clientY - downY) > 10) {
+            if (Math.hypot(e.touches[0].clientX - downX, e.touches[0].clientY - downY) > TAP_MOVE_THRESHOLD_PX) {
               pointerMoved = true;
             }
           }
@@ -6610,7 +6776,7 @@
         pointerMoved = false;
       });
       this.scrollEl.addEventListener("mousemove", (e) => {
-        if (e.buttons && Math.hypot(e.clientX - downX, e.clientY - downY) > 10) {
+        if (e.buttons && Math.hypot(e.clientX - downX, e.clientY - downY) > TAP_MOVE_THRESHOLD_PX) {
           pointerMoved = true;
         }
       });
@@ -6619,12 +6785,6 @@
         if (pointerMoved) {
           pointerMoved = false;
           return;
-        }
-        try {
-          if ((_a = window.getSelection()) == null ? void 0 : _a.toString().trim()) {
-            return;
-          }
-        } catch {
         }
         const target = e.target;
         if (!target || target.closest(".reader-tail-bar, .top-prev-wrap, button, a, input, select")) {
@@ -6648,8 +6808,12 @@
           return;
         }
         const now = Date.now();
-        if (this.lastTapChapterId === chapterId && this.lastTapChunkIdx === chunkIdx && now - this.lastTapAt <= 320) {
+        if (this.lastTapChapterId === chapterId && Math.abs(this.lastTapChunkIdx - chunkIdx) <= 1 && now - this.lastTapAt <= DOUBLE_TAP_WINDOW_MS) {
           this.clearSingleTapTimer();
+          try {
+            (_a = window.getSelection()) == null ? void 0 : _a.removeAllRanges();
+          } catch {
+          }
           this.events.onSeekSentence(chapterId, chunkIdx);
           return;
         }
@@ -6664,7 +6828,7 @@
           if (this.opened && !this.isMenuOpen) {
             this.setMenuOpen(true);
           }
-        }, 240);
+        }, SINGLE_TAP_DELAY_MS);
       });
       this.relocateBtn.addEventListener("click", () => {
         this.lastUserScrollAt = 0;
@@ -6686,6 +6850,26 @@
       this.shadow.querySelector("#rv-top-worker").addEventListener("click", () => {
         this.setSubpanel(this.activeSubpanel === "worker" ? "none" : "worker");
       });
+      this.fullscreenBtn.addEventListener("click", () => {
+        var _a, _b, _c, _d, _e, _f, _g;
+        if (typeof document === "undefined") return;
+        try {
+          if (document.fullscreenElement) {
+            void ((_c = (_b = (_a = document.exitFullscreen) == null ? void 0 : _a.call(document)) == null ? void 0 : _b.catch) == null ? void 0 : _c.call(_b, () => {
+            }));
+          } else {
+            void ((_g = (_f = (_e = (_d = document.documentElement) == null ? void 0 : _d.requestFullscreen) == null ? void 0 : _e.call(_d)) == null ? void 0 : _f.catch) == null ? void 0 : _g.call(_f, () => {
+            }));
+          }
+        } catch {
+        }
+      });
+      if (typeof document !== "undefined") {
+        this.onFullscreenChangeHandler = () => {
+          this.fullscreenBtn.textContent = document.fullscreenElement ? "退全屏" : "全屏";
+        };
+        document.addEventListener("fullscreenchange", this.onFullscreenChangeHandler);
+      }
       this.shadow.querySelector("#rv-mini-prev").addEventListener("click", () => {
         this.events.onPrevSentence();
       });

@@ -766,6 +766,18 @@ export class NovelPlayer {
   seek(index: number): void {
     if (this.sentences.length === 0) return;
     this.clearRetryTimer();
+    this.playToken++;
+
+    if (this.isUsingFallback) {
+      this.webSpeechEngine.cancel();
+    } else if (this.audio && typeof this.audio.pause === 'function') {
+      try {
+        this.audio.pause();
+      } catch {
+        // 忽略
+      }
+    }
+
     this.unlockAllAudio({ audio: !this.isUsingFallback, speech: false });
     const target = Math.max(0, Math.min(index, this.sentences.length - 1));
     this.clearPrefetchCache();

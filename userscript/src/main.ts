@@ -17,7 +17,7 @@ import { ReaderView, type LoadedReaderChapter } from './ui/readerView';
 import { PageHighlighter } from './ui/pageHighlighter';
 import type { ChapterContent, TocData, TocItem } from './core/tts/types';
 
-export const VERSION = '0.4.1';
+export const VERSION = '0.4.2';
 
 const READER_RESUME_KEY = 'novel_tts_reader_resume_ts';
 const READER_RESUME_TTL_MS = 120_000;

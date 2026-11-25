@@ -196,12 +196,28 @@ describe('readerView.ts & floatingBar.ts - 阅读模式(目录+无限滚动)与�
     expect(onSeekSentence).toHaveBeenCalledTimes(1);
     expect(onSeekSentence).toHaveBeenCalledWith(ch2.id, 1);
 
-    vi.advanceTimersByTime(300);
+    vi.advanceTimersByTime(360);
     expect(topBar.classList.contains('open')).toBe(false);
+
+    // 即使浏览器残留了非空文本选区，连续再次双击其他句依然灵敏有效
+    const removeAllRanges = vi.fn();
+    vi.spyOn(window, 'getSelection').mockReturnValue({
+      toString: () => '残留选区文字',
+      removeAllRanges,
+    } as any);
+
+    const firstSpan = shadow.querySelector(
+      `.reader-chapter[data-chapter-id="${ch2.id}"] .reader-sentence[data-chunk-index="0"]`
+    ) as HTMLElement;
+    firstSpan.click();
+    firstSpan.click();
+    expect(onSeekSentence).toHaveBeenCalledTimes(2);
+    expect(onSeekSentence).toHaveBeenLastCalledWith(ch2.id, 0);
+    expect(removeAllRanges).toHaveBeenCalled();
 
     // 单击展开菜单后再点击正文立刻收起
     targetSpan.click();
-    vi.advanceTimersByTime(260);
+    vi.advanceTimersByTime(360);
     expect(topBar.classList.contains('open')).toBe(true);
     targetSpan.click();
     expect(topBar.classList.contains('open')).toBe(false);
@@ -321,11 +337,21 @@ describe('readerView.ts & floatingBar.ts - 阅读模式(目录+无限滚动)与�
     expect(onOpenReader).toHaveBeenCalledTimes(1);
   });
 
-  it('挂载于 documentElement 时彻底隔离底层页面与广告横幅（z-index 2147483646），并支持章尾重试加载与自定义重试提示', () => {
+  it('挂载于 documentElement 时彻底隔离底层页面、同步顶底 theme-color / viewport-fit=cover 并在退出时无痕恢复', () => {
     const onRetryAppendNext = vi.fn();
     const scrollToSpy = vi.spyOn(window, 'scrollTo').mockImplementation(() => {});
     const origScrollYDesc = Object.getOwnPropertyDescriptor(window, 'scrollY');
     Object.defineProperty(window, 'scrollY', { value: 320, configurable: true });
+
+    const themeMeta = document.createElement('meta');
+    themeMeta.name = 'theme-color';
+    themeMeta.content = '#ffffff';
+    document.head.appendChild(themeMeta);
+
+    const viewportMeta = document.createElement('meta');
+    viewportMeta.name = 'viewport';
+    viewportMeta.content = 'width=device-width, initial-scale=1.0';
+    document.head.appendChild(viewportMeta);
 
     try {
       readerView = new ReaderView(makeConfig(), makeEvents({ onRetryAppendNext }));
@@ -348,7 +374,23 @@ describe('readerView.ts & floatingBar.ts - 阅读模式(目录+无限滚动)与�
       expect(isoStyle).not.toBeNull();
       expect(isoStyle!.textContent).toContain('html.novel-tts-reader-active');
 
+      // 校验默认 sepia 主题同步至 meta[name=theme-color]、viewport 与 CSS 变量
+      expect(themeMeta.getAttribute('content')).toBe('#f4ecd8');
+      expect(viewportMeta.getAttribute('content')).toBe(
+        'width=device-width, initial-scale=1.0, viewport-fit=cover'
+      );
+      expect(
+        document.documentElement.style.getPropertyValue('--novel-tts-reader-bg')
+      ).toBe('#f4ecd8');
+
+      // 切换为夜间主题时同步更新浏览器顶底着色
       const shadow = rootHost.shadowRoot!;
+      (shadow.querySelector('[data-theme-opt="dark"]') as HTMLElement).click();
+      expect(themeMeta.getAttribute('content')).toBe('#12151c');
+      expect(
+        document.documentElement.style.getPropertyValue('--novel-tts-reader-bg')
+      ).toBe('#12151c');
+
       readerView.setAppendStatus('loading', '加载异常 (请求超时)，正在第 1/2 次自动重试…');
       expect(shadow.querySelector('#rv-tail-status')!.textContent).toContain('第 1/2 次自动重试');
 
@@ -360,8 +402,15 @@ describe('readerView.ts & floatingBar.ts - 阅读模式(目录+无限滚动)与�
 
       readerView.close();
       expect(document.documentElement.classList.contains('novel-tts-reader-active')).toBe(false);
+      expect(themeMeta.getAttribute('content')).toBe('#ffffff');
+      expect(viewportMeta.getAttribute('content')).toBe('width=device-width, initial-scale=1.0');
+      expect(
+        document.documentElement.style.getPropertyValue('--novel-tts-reader-bg')
+      ).toBe('');
       expect(scrollToSpy).toHaveBeenCalledWith(0, 320);
     } finally {
+      themeMeta.remove();
+      viewportMeta.remove();
       if (origScrollYDesc) {
         Object.defineProperty(window, 'scrollY', origScrollYDesc);
       } else {

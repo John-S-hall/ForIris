@@ -63,8 +63,20 @@ type DockSubpanel = 'none' | 'appearance' | 'tts' | 'worker';
 const USER_SCROLL_PROTECT_MS = 4000;
 const MAX_RENDERED_CHAPTERS = 5;
 const INFINITE_SCROLL_PRELOAD_PX = 700;
+const DOUBLE_TAP_WINDOW_MS = 340;
+const SINGLE_TAP_DELAY_MS = 350;
+const TAP_MOVE_THRESHOLD_PX = 15;
 const ISOLATION_STYLE_ID = 'novel-tts-reader-host-isolation';
+const INJECTED_THEME_META_ID = 'novel-tts-theme-color';
+const INJECTED_VIEWPORT_META_ID = 'novel-tts-viewport';
 const READER_ACTIVE_CLASS = 'novel-tts-reader-active';
+
+const THEME_CHROME_MAP: Record<ReaderTheme, { bg: string; scheme: 'light' | 'dark' }> = {
+  light: { bg: '#f8fafc', scheme: 'light' },
+  sepia: { bg: '#f4ecd8', scheme: 'light' },
+  green: { bg: '#cce8cf', scheme: 'light' },
+  dark: { bg: '#12151c', scheme: 'dark' },
+};
 
 const LINE_HEIGHT_PRESETS: ReadonlyArray<{ value: number; label: string }> = [
   { value: 1.6, label: '紧凑' },
@@ -115,12 +127,18 @@ export class ReaderView {
   private isMenuOpen = false;
   private activeSubpanel: DockSubpanel = 'none';
 
-  // 原网页滚动与样式隔离状态备份
+  // 原网页滚动与顶底全屏沉浸状态备份
   private hasSavedPageState = false;
+  private isChromeSynced = false;
   private savedHtmlOverflow: string | null = null;
   private savedBodyOverflow: string | null = null;
   private savedScrollX = 0;
   private savedScrollY = 0;
+  private savedThemeMetas: Array<{ el: HTMLMetaElement; prevContent: string | null }> = [];
+  private injectedThemeMeta: HTMLMetaElement | null = null;
+  private savedViewportMeta: { el: HTMLMetaElement; prevContent: string | null } | null = null;
+  private injectedViewportMeta: HTMLMetaElement | null = null;
+  private onFullscreenChangeHandler: (() => void) | null = null;
 
   // 手动滑动保护与双击识别
   private lastUserScrollAt = 0;
@@ -151,6 +169,7 @@ export class ReaderView {
   private topBarEl!: HTMLElement;
   private topTitleEl!: HTMLElement;
   private jumpBtn!: HTMLButtonElement;
+  private fullscreenBtn!: HTMLButtonElement;
 
   private bottomDockEl!: HTMLElement;
   private panelAppearanceEl!: HTMLElement;
@@ -207,7 +226,12 @@ export class ReaderView {
 
   private applyHostStyles(): void {
     this.host.style.setProperty('position', 'fixed', 'important');
-    this.host.style.setProperty('inset', '0', 'important');
+    this.host.style.setProperty('top', '0', 'important');
+    this.host.style.setProperty('left', '0', 'important');
+    this.host.style.setProperty('right', '0', 'important');
+    this.host.style.setProperty('bottom', '0', 'important');
+    this.host.style.setProperty('width', '100%', 'important');
+    this.host.style.setProperty('height', '100%', 'important');
     this.host.style.setProperty('z-index', '2147483646', 'important');
     this.host.style.setProperty('display', 'none', 'important');
     this.host.style.setProperty('margin', '0', 'important');
@@ -227,6 +251,19 @@ export class ReaderView {
     style.textContent = `
       html.${READER_ACTIVE_CLASS} {
         overflow: hidden !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border: 0 !important;
+        width: 100% !important;
+        max-width: none !important;
+        height: 100% !important;
+        min-height: 100% !important;
+        transform: none !important;
+        filter: none !important;
+        perspective: none !important;
+        zoom: 1 !important;
+        background: var(--novel-tts-reader-bg, #f4ecd8) !important;
+        color-scheme: var(--novel-tts-reader-scheme, light) !important;
       }
       html.${READER_ACTIVE_CLASS} > *:not(head):not(#novel-tts-reader-root):not(#novel-tts-floating-root) {
         display: none !important;
@@ -235,6 +272,110 @@ export class ReaderView {
       }
     `;
     target.appendChild(style);
+  }
+
+  private syncDocumentChrome(theme: ReaderTheme): void {
+    if (typeof document === 'undefined') return;
+    const chrome = THEME_CHROME_MAP[theme] || THEME_CHROME_MAP.sepia;
+
+    document.documentElement.style.setProperty('--novel-tts-reader-bg', chrome.bg);
+    document.documentElement.style.setProperty('--novel-tts-reader-scheme', chrome.scheme);
+
+    const headTarget = document.head || document.documentElement;
+    if (!this.isChromeSynced) {
+      this.isChromeSynced = true;
+
+      const existingThemes = Array.from(
+        document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]')
+      );
+      if (existingThemes.length > 0) {
+        this.savedThemeMetas = existingThemes.map((el) => ({
+          el,
+          prevContent: el.getAttribute('content'),
+        }));
+      } else if (headTarget) {
+        const meta = document.createElement('meta');
+        meta.id = INJECTED_THEME_META_ID;
+        meta.name = 'theme-color';
+        headTarget.appendChild(meta);
+        this.injectedThemeMeta = meta;
+      }
+
+      const existingViewport = document.querySelector<HTMLMetaElement>('meta[name="viewport"]');
+      if (existingViewport) {
+        const prevContent = existingViewport.getAttribute('content');
+        this.savedViewportMeta = { el: existingViewport, prevContent };
+        if (!(prevContent || '').toLowerCase().includes('viewport-fit=cover')) {
+          existingViewport.setAttribute(
+            'content',
+            prevContent
+              ? `${prevContent}, viewport-fit=cover`
+              : 'width=device-width, initial-scale=1.0, viewport-fit=cover'
+          );
+        }
+      } else if (headTarget) {
+        const meta = document.createElement('meta');
+        meta.id = INJECTED_VIEWPORT_META_ID;
+        meta.name = 'viewport';
+        meta.setAttribute('content', 'width=device-width, initial-scale=1.0, viewport-fit=cover');
+        headTarget.appendChild(meta);
+        this.injectedViewportMeta = meta;
+      }
+    }
+
+    for (const entry of this.savedThemeMetas) {
+      entry.el.setAttribute('content', chrome.bg);
+    }
+    if (this.injectedThemeMeta) {
+      this.injectedThemeMeta.setAttribute('content', chrome.bg);
+    }
+  }
+
+  private restoreDocumentChrome(): void {
+    if (typeof document === 'undefined') return;
+    document.documentElement.style.removeProperty('--novel-tts-reader-bg');
+    document.documentElement.style.removeProperty('--novel-tts-reader-scheme');
+
+    for (const entry of this.savedThemeMetas) {
+      if (entry.prevContent === null) {
+        entry.el.removeAttribute('content');
+      } else {
+        entry.el.setAttribute('content', entry.prevContent);
+      }
+    }
+    this.savedThemeMetas = [];
+
+    if (this.injectedThemeMeta && this.injectedThemeMeta.parentNode) {
+      this.injectedThemeMeta.parentNode.removeChild(this.injectedThemeMeta);
+    }
+    this.injectedThemeMeta = null;
+
+    if (this.savedViewportMeta) {
+      const { el, prevContent } = this.savedViewportMeta;
+      if (prevContent === null) {
+        el.removeAttribute('content');
+      } else {
+        el.setAttribute('content', prevContent);
+      }
+      this.savedViewportMeta = null;
+    }
+
+    if (this.injectedViewportMeta && this.injectedViewportMeta.parentNode) {
+      this.injectedViewportMeta.parentNode.removeChild(this.injectedViewportMeta);
+    }
+    this.injectedViewportMeta = null;
+    this.isChromeSynced = false;
+
+    if (
+      document.fullscreenElement === document.documentElement ||
+      document.fullscreenElement === this.host
+    ) {
+      try {
+        void (document as any).exitFullscreen?.()?.catch?.(() => {});
+      } catch {
+        // 忽略环境差异
+      }
+    }
   }
 
   mount(parent?: HTMLElement): void {
@@ -247,6 +388,10 @@ export class ReaderView {
   unmount(): void {
     this.clearSingleTapTimer();
     this.restorePageOverflow();
+    if (typeof document !== 'undefined' && this.onFullscreenChangeHandler) {
+      document.removeEventListener('fullscreenchange', this.onFullscreenChangeHandler);
+      this.onFullscreenChangeHandler = null;
+    }
     if (this.host.parentNode) {
       this.host.parentNode.removeChild(this.host);
     }
@@ -274,6 +419,7 @@ export class ReaderView {
       if (this.host.parentNode === document.documentElement) {
         document.documentElement.classList.add(READER_ACTIVE_CLASS);
       }
+      this.syncDocumentChrome(this.settings.theme);
       this.hasSavedPageState = true;
     }
 
@@ -297,6 +443,7 @@ export class ReaderView {
   private restorePageOverflow(): void {
     if (typeof document === 'undefined') return;
     document.documentElement.classList.remove(READER_ACTIVE_CLASS);
+    this.restoreDocumentChrome();
 
     if (this.savedHtmlOverflow !== null) {
       document.documentElement.style.overflow = this.savedHtmlOverflow;
@@ -692,6 +839,9 @@ export class ReaderView {
       const val = Number.parseFloat(btn.dataset.lineHeight || '0');
       btn.classList.toggle('active', Math.abs(val - settings.lineHeight) < 0.05);
     });
+    if (this.opened) {
+      this.syncDocumentChrome(settings.theme);
+    }
     this.updateChapterControlsUI();
   }
 
@@ -1023,6 +1173,7 @@ export class ReaderView {
         <button class="bar-text-btn" id="rv-exit">← 退出阅读</button>
         <span class="top-title" id="rv-top-title">阅读模式</span>
         <button class="bar-text-btn accent" id="rv-jump" style="display:none">查看原文</button>
+        <button class="bar-text-btn accent" id="rv-fullscreen" style="display:none" title="切换系统全屏">全屏</button>
         <button class="bar-text-btn" id="rv-top-worker" title="配置 Worker">⚙️</button>
       </div>
 
@@ -1153,6 +1304,15 @@ export class ReaderView {
     this.topBarEl = this.shadow.querySelector('#rv-top-bar')!;
     this.topTitleEl = this.shadow.querySelector('#rv-top-title')!;
     this.jumpBtn = this.shadow.querySelector('#rv-jump')!;
+    this.fullscreenBtn = this.shadow.querySelector('#rv-fullscreen')!;
+
+    const supportsFullscreen =
+      typeof document !== 'undefined' &&
+      Boolean((document as any).fullscreenEnabled) &&
+      typeof document.documentElement?.requestFullscreen === 'function';
+    if (supportsFullscreen) {
+      this.fullscreenBtn.style.display = 'inline-flex';
+    }
 
     this.bottomDockEl = this.shadow.querySelector('#rv-bottom-dock')!;
     this.panelAppearanceEl = this.shadow.querySelector('#rv-panel-appearance')!;
@@ -1231,7 +1391,10 @@ export class ReaderView {
       'touchmove',
       (e) => {
         if (e.touches.length === 1) {
-          if (Math.hypot(e.touches[0].clientX - downX, e.touches[0].clientY - downY) > 10) {
+          if (
+            Math.hypot(e.touches[0].clientX - downX, e.touches[0].clientY - downY) >
+            TAP_MOVE_THRESHOLD_PX
+          ) {
             pointerMoved = true;
           }
         }
@@ -1244,7 +1407,10 @@ export class ReaderView {
       pointerMoved = false;
     });
     this.scrollEl.addEventListener('mousemove', (e) => {
-      if (e.buttons && Math.hypot(e.clientX - downX, e.clientY - downY) > 10) {
+      if (
+        e.buttons &&
+        Math.hypot(e.clientX - downX, e.clientY - downY) > TAP_MOVE_THRESHOLD_PX
+      ) {
         pointerMoved = true;
       }
     });
@@ -1253,14 +1419,6 @@ export class ReaderView {
       if (pointerMoved) {
         pointerMoved = false;
         return;
-      }
-
-      try {
-        if (window.getSelection()?.toString().trim()) {
-          return;
-        }
-      } catch {
-        // ignore
       }
 
       const target = e.target as HTMLElement | null;
@@ -1294,11 +1452,16 @@ export class ReaderView {
       const now = Date.now();
       if (
         this.lastTapChapterId === chapterId &&
-        this.lastTapChunkIdx === chunkIdx &&
-        now - this.lastTapAt <= 320
+        Math.abs(this.lastTapChunkIdx - chunkIdx) <= 1 &&
+        now - this.lastTapAt <= DOUBLE_TAP_WINDOW_MS
       ) {
-        // 双击同一章同一句：同步触发起播（保留 iOS Safari 用户激活栈）
+        // 双击起播/跳播：清除潜在选区，并在同步事件栈内立刻触发以保留 iOS 用户手势解锁
         this.clearSingleTapTimer();
+        try {
+          window.getSelection()?.removeAllRanges();
+        } catch {
+          // 忽略
+        }
         this.events.onSeekSentence(chapterId, chunkIdx);
         return;
       }
@@ -1314,7 +1477,7 @@ export class ReaderView {
         if (this.opened && !this.isMenuOpen) {
           this.setMenuOpen(true);
         }
-      }, 240);
+      }, SINGLE_TAP_DELAY_MS);
     });
 
     // 回到朗读处
@@ -1341,6 +1504,24 @@ export class ReaderView {
     this.shadow.querySelector('#rv-top-worker')!.addEventListener('click', () => {
       this.setSubpanel(this.activeSubpanel === 'worker' ? 'none' : 'worker');
     });
+    this.fullscreenBtn.addEventListener('click', () => {
+      if (typeof document === 'undefined') return;
+      try {
+        if (document.fullscreenElement) {
+          void (document as any).exitFullscreen?.()?.catch?.(() => {});
+        } else {
+          void document.documentElement?.requestFullscreen?.()?.catch?.(() => {});
+        }
+      } catch {
+        // 忽略环境差异
+      }
+    });
+    if (typeof document !== 'undefined') {
+      this.onFullscreenChangeHandler = () => {
+        this.fullscreenBtn.textContent = document.fullscreenElement ? '退全屏' : '全屏';
+      };
+      document.addEventListener('fullscreenchange', this.onFullscreenChangeHandler);
+    }
 
     // 迷你条按钮
     this.shadow.querySelector('#rv-mini-prev')!.addEventListener('click', () => {

@@ -389,4 +389,30 @@ describe('player.ts - 核心播放器与预取状态机', () => {
     expect(player.isFallbackMode()).toBe(true);
     expect(toasts.some((t) => t.includes('系统语音朗读'))).toBe(true);
   });
+
+  it('播放过程中连续调用 seek 时先暂停旧音频并准确跳转到目标句索引', async () => {
+    const player = new NovelPlayer({
+      provider: mockProvider,
+    });
+
+    await player.playChapter(testChapter);
+    expect(player.getCurrentIndex()).toBe(0);
+
+    const pauseSpy = window.HTMLMediaElement.prototype.pause as ReturnType<typeof vi.fn>;
+    pauseSpy.mockClear();
+
+    player.seek(2);
+    await vi.waitFor(() => {
+      expect(player.getCurrentIndex()).toBe(2);
+      expect(player.getState()).toBe('playing');
+    });
+    expect(pauseSpy).toHaveBeenCalledTimes(1);
+
+    player.seek(4);
+    await vi.waitFor(() => {
+      expect(player.getCurrentIndex()).toBe(4);
+      expect(player.getState()).toBe('playing');
+    });
+    expect(pauseSpy).toHaveBeenCalledTimes(2);
+  });
 });

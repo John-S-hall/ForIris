@@ -7,13 +7,24 @@ export const READER_STYLES = `
 
   .reader-root {
     position: fixed;
-    inset: 0;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    height: 100%;
+    min-height: 100dvh;
     display: flex;
     flex-direction: column;
     background: var(--bg);
     color: var(--text);
     --reader-font-size: 18px;
     --reader-line-height: 1.85;
+  }
+
+  input, select, textarea {
+    -webkit-user-select: text;
+    user-select: text;
   }
 
   /* 4 套夸克风格主题 */
@@ -104,12 +115,18 @@ export const READER_STYLES = `
     -webkit-overflow-scrolling: touch;
     overscroll-behavior: contain;
     touch-action: manipulation;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
   }
   .reader-article {
     max-width: 720px;
     margin: 0 auto;
     padding: calc(44px + env(safe-area-inset-top, 0px)) 20px calc(110px + env(safe-area-inset-bottom, 0px));
     box-sizing: border-box;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
   }
 
   .top-prev-wrap {
